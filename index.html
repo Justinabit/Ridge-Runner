@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>RIDGE RUNNER</title>
+<link rel="stylesheet" href="style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+</head>
+<body>
+
+  <canvas id="game-canvas"></canvas>
+
+  <!-- ===== LOADING SCREEN ===== -->
+  <div id="loading-screen">
+    <div class="loading-title">RIDGE<span>RUNNER</span></div>
+    <div class="loading-bar"><div class="loading-bar-fill" id="loading-fill"></div></div>
+    <div class="loading-tip" id="loading-tip">TIP: TILT IN THE AIR TO STICK YOUR LANDING</div>
+  </div>
+
+  <!-- ===== START OVERLAY ===== -->
+  <div id="start-screen" class="hidden">
+    <div class="start-title">RIDGE<span>RUNNER</span></div>
+    <div class="start-sub">a low&#8209;poly hill&#8209;climb</div>
+    <button id="start-btn" class="chunky-btn">START ENGINE</button>
+    <div class="controls-hint">
+      <div><b>W / &uarr;</b> gas &nbsp; <b>S / &darr;</b> brake</div>
+      <div><b>A / D</b> tilt in air &nbsp; <b>SPACE</b> handbrake</div>
+      <div><b>C</b> camera &nbsp; <b>R</b> reset</div>
+    </div>
+  </div>
+
+  <!-- ===== HUD ===== -->
+  <div id="hud" class="hidden">
+    <div class="hud-top-left">
+      <div class="hud-panel">
+        <div class="hud-label">DISTANCE</div>
+        <div class="hud-value" id="hud-distance">0<span class="hud-unit">m</span></div>
+      </div>
+      <div class="hud-panel">
+        <div class="hud-label">SCORE</div>
+        <div class="hud-value" id="hud-score">0</div>
+      </div>
+    </div>
+
+    <div class="hud-top-right">
+      <button id="camera-toggle" class="icon-btn" title="Toggle camera (C)">&#128247;</button>
+      <div class="zone-tag" id="zone-tag">SUNSET HILLS</div>
+    </div>
+
+    <div class="hud-bottom">
+      <div class="gauge-wrap">
+        <div class="gauge-label">SPEED</div>
+        <div class="gauge-track"><div class="gauge-fill speed-fill" id="speed-fill"></div></div>
+      </div>
+      <div class="gauge-wrap">
+        <div class="gauge-label">FUEL</div>
+        <div class="gauge-track"><div class="gauge-fill fuel-fill" id="fuel-fill"></div></div>
+      </div>
+    </div>
+
+    <div class="air-badge hidden" id="air-badge">AIRBORNE!</div>
+    <div class="flip-badge hidden" id="flip-badge">FLIP! +500</div>
+  </div>
+
+  <!-- ===== TOUCH CONTROLS ===== -->
+  <div class="touch-controls" id="touch-controls">
+    <div class="touch-btn" id="btn-left">&#9664;</div>
+    <div class="touch-btn" id="btn-right">&#9654;</div>
+    <div class="touch-btn" id="btn-brake">&#9660;</div>
+    <div class="touch-btn" id="btn-gas">&#9650;</div>
+  </div>
+
+  <!-- ===== CRASH / GAME OVER OVERLAY ===== -->
+  <div id="crash-screen" class="hidden">
+    <div class="crash-title">CRASHED</div>
+    <div class="crash-stats">
+      <div>Distance: <span id="crash-distance">0</span>m</div>
+      <div>Score: <span id="crash-score">0</span></div>
+    </div>
+    <button id="retry-btn" class="chunky-btn">TRY AGAIN</button>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
