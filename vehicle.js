@@ -209,7 +209,14 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
      * car, and it makes small high-speed corrections feel twitchy. */
     const speedFrac = THREE.MathUtils.clamp(Math.abs(forwardSpeed) / TOP_SPEED, 0, 1);
     const steerLimit = MAX_STEER * (1 - STEER_SPEED_FALLOFF * speedFrac);
-    const steerTarget = controls.steer * steerLimit;
+    // SIGN: the car drives toward +Z and the camera sits behind it looking the
+    // same way, which puts world +X on the LEFT of the screen. A right-handed
+    // system viewed along +Z is mirrored compared to the usual view along -Z,
+    // which is easy to get backwards. Verified by reading the camera's local +X
+    // axis in world space: it is (-1, 0, 0) in both chase and cockpit modes.
+    // So a positive controls.steer -- the D key, meaning "right" to the player
+    // -- must produce a turn toward -X. Hence the negation.
+    const steerTarget = -controls.steer * steerLimit;
     // frame-rate independent smoothing, so steering feels identical at 30 and 144 fps
     steer = THREE.MathUtils.lerp(steer, steerTarget, 1 - Math.pow(STEER_RESPONSE, dt));
     for (const i of FRONT_WHEELS) vehicle.setSteeringValue(steer, i);
