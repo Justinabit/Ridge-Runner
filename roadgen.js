@@ -60,14 +60,27 @@ export function sampleRoadFrame(z) {
   // banking derived from lateral curvature change (roll into turns) — same
   // formula the old spline-based track used per control point
   const dx = lateralAt(zFwd) - lateralAt(zBack);
-  const bank = THREE.MathUtils.clamp(-dx * 0.045, -0.55, 0.55);
+  const bank = THREE.MathUtils.clamp(dx * 0.045, -0.45, 0.45);
 
+  // FIX (handedness): this used to be `tangent x up`, which for a road running
+  // along +Z yields -X — a LEFT-handed frame. Every road quad was therefore
+  // wound backwards, giving each triangle a downward-facing normal. Two things
+  // broke as a result, and both looked like separate bugs:
+  //   1. cannon-es's RaycastVehicle casts its wheel rays with skipBackfaces:true,
+  //      so every wheel ray hit the road's *back* face and was discarded. The car
+  //      never registered ground contact and free-fell through the world forever.
+  //   2. three.js culls back faces by default, so the road surface was invisible
+  //      when viewed from above.
+  // `up x tangent` gives a proper right-handed frame (+X for a +Z road), which
+  // fixes the winding — and therefore both symptoms — at the source.
   const up = new THREE.Vector3(0, 1, 0);
-  let right = new THREE.Vector3().crossVectors(tangent, up).normalize();
+  let right = new THREE.Vector3().crossVectors(up, tangent).normalize();
   if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
   const quat = new THREE.Quaternion().setFromAxisAngle(tangent, bank);
   right.applyQuaternion(quat);
-  const roadUp = new THREE.Vector3().crossVectors(right, tangent).normalize();
+  // roadUp must be flipped to match the corrected `right`, or it would now
+  // point into the ground.
+  const roadUp = new THREE.Vector3().crossVectors(tangent, right).normalize();
 
   return { center: new THREE.Vector3(x, y, z), tangent, right, roadUp, bank };
 }
