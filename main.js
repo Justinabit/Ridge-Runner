@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
-import { sampleRoad } from './roadgen.js';
-import { createTerrainManager } from './terrain.js';
-import { createVehicle } from './vehicle.js';
+import { sampleRoad, sampleRoadFrame, ROAD_WIDTH } from './roadgen.js';
+import { createTerrainManager, ROAD_MATERIAL, BARRIER_MATERIAL } from './terrain.js';
+import { createVehicle, CHASSIS_MATERIAL } from './vehicle.js';
 import { createCameraController } from './camera.js';
 import { createZoneManager } from './zones.js';
+import { setLampsLit } from './scenery.js';
 import { createPickupManager, PICKUP, FUEL_PER_CAN, BOOST_SECONDS, SHIELD_SECONDS, DOUBLE_SECONDS } from './pickups.js';
 import { createHazardManager, HAZARD, ROCK_DAMAGE, BARREL_DAMAGE, OIL_GRIP_PENALTY, OIL_SECONDS } from './hazards.js';
 import { createEffects } from './effects.js';
@@ -119,6 +120,28 @@ async function boot() {
   world.broadphase = new CANNON.SAPBroadphase(world);
   world.solver.iterations = 12;
   world.defaultContactMaterial.friction = 0.4;
+
+  /* Guardrails are almost frictionless against the chassis, with a little
+   * bounce. Previously they used the world default of 0.4, which meant clipping
+   * a rail at speed killed nearly all forward momentum and parked the car
+   * against the wall. Now it slides along and scrapes. */
+  /* Barrier friction is deliberately ZERO. Solver friction against a wall the
+   * car is being driven into is violently nonlinear, because the normal force
+   * needed to resolve the penetration is huge and the friction force scales
+   * with it. Measured, clipping a rail at 122 km/h and straightening up:
+   *     mu = 0.40  ->   0% of speed kept (dead stop, the reported bug)
+   *     mu = 0.20  ->   0%
+   *     mu = 0.02  ->  12%
+   *     mu = 0.00  ->  95%
+   * There is no usable value between "sticks like glue" and "frictionless", so
+   * the wall is frictionless and the cost of scraping is applied as a scripted
+   * scrub in step() instead, where it can actually be tuned. */
+  world.addContactMaterial(new CANNON.ContactMaterial(CHASSIS_MATERIAL, BARRIER_MATERIAL, {
+    friction: 0, restitution: 0.25,
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(CHASSIS_MATERIAL, ROAD_MATERIAL, {
+    friction: 0.35, restitution: 0,
+  }));
   updateProgress(6, 'Setting up physics...');
   await yieldFrame();
 
@@ -317,6 +340,8 @@ const FIXED_DT = 1 / 120;
 const MAX_STEPS = 8;
 let accumulator = 0;
 const _fwd = new THREE.Vector3();
+const _rel = new THREE.Vector3();
+const _scrapePoint = new THREE.Vector3();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -408,10 +433,31 @@ function step(dt) {
   // FIX: headlights were 3.2 with a 40 m throw, which at 34 m/s lit barely a
   // second of road. Brighter and much further now, and they stay dimly on by
   // day so the car reads as a vehicle rather than a box.
+  setLampsLit(zoneInfo.isNight);
   vehicle.headlights.forEach((l) => {
     l.intensity = zoneInfo.isNight ? 6.5 : 0.35;
     l.distance = zoneInfo.isNight ? 110 : 40;
   });
+
+  /* Wall scrape. Measured from the road frame rather than from contact events:
+   * it is cheap, deterministic, and gives a contact point to throw sparks from
+   * without digging through the solver's contact list. */
+  const frame = sampleRoadFrame(st.position.z);
+  _rel.set(st.position.x - frame.center.x, st.position.y - frame.center.y, st.position.z - frame.center.z);
+  const lateral = _rel.dot(frame.right);
+  const scraping = Math.abs(lateral) > (ROAD_WIDTH / 2 - 1.25) && st.speed > 4 && st.grounded;
+  if (scraping) {
+    const side = Math.sign(lateral);
+    _scrapePoint.copy(st.position).addScaledVector(frame.right, side * 0.9);
+    effects.impactSparks(_scrapePoint, 3);
+    cameraController.addTrauma(0.035);
+    // Scripted cost of riding the rail: a predictable ~18%/s speed scrub plus a
+    // slow hull bleed. Doing it here rather than through solver friction is
+    // what keeps a glancing hit from becoming a dead stop.
+    const b = vehicle.chassisBody;
+    b.velocity.scale(Math.pow(0.82, dt), b.velocity);
+    health -= dt * 2.5;
+  }
 
   effects.wheelDust(st.wheelPositions, st.speed, st.grounded, dt);
   if (timers.boost > 0) {
@@ -426,6 +472,7 @@ function step(dt) {
   audio.update({
     speed: st.speed, throttle: controls.throttle, grounded: st.grounded,
     sliding: st.sliding, shielded: timers.shield > 0, boosting: timers.boost > 0,
+    scraping,
   }, st.topSpeed);
 
   /* ---- end conditions ---- */

@@ -31,8 +31,12 @@ const frondGeo = new THREE.ConeGeometry(0.38, 1.9, 4);
 const rockGeo = new THREE.DodecahedronGeometry(0.75, 0);
 const tuftGeo = new THREE.ConeGeometry(0.22, 0.7, 4);
 const poleGeo = new THREE.CylinderGeometry(0.09, 0.12, 5.2, 6);
-const armGeo = new THREE.BoxGeometry(1.5, 0.14, 0.14);
-const headGeo = new THREE.BoxGeometry(0.62, 0.26, 0.38);
+// NOTE: addInstanced applies a Y rotation of `yaw`, which maps local +Z onto
+// the road's `right` vector. So anything meant to point ACROSS the road must be
+// long in Z, not X. The arm was 1.5 long in X, which aimed it along the road and
+// left the lamp head floating unattached beside it.
+const armGeo = new THREE.BoxGeometry(0.14, 0.14, 1.6);
+const headGeo = new THREE.BoxGeometry(0.34, 0.24, 0.66);
 
 const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5b3a29, flatShading: true });
 const pineMat = new THREE.MeshLambertMaterial({ color: 0x2f6b3f, flatShading: true });
@@ -43,9 +47,16 @@ const rockMat = new THREE.MeshLambertMaterial({ color: 0x8b8a92, flatShading: tr
 const tuftMat = new THREE.MeshLambertMaterial({ color: 0x5f9b48, flatShading: true });
 const poleMat = new THREE.MeshLambertMaterial({ color: 0x3b3a44, flatShading: true });
 
-// Lamp heads are emissive-looking (MeshBasic ignores lighting) so they read as
-// lit at night without costing a real light each. zones.js dims them by day.
-export const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffd9a0 });
+/* Lamp heads use MeshBasic so they ignore scene lighting and read as self-lit
+ * at night without costing a real light each. Call setLampsLit() to switch them
+ * between lit and unlit; nothing dims them automatically. */
+export const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0x6a6552 });
+const LAMP_LIT = new THREE.Color(0xfff0c0);
+const LAMP_UNLIT = new THREE.Color(0x6a6552);
+
+export function setLampsLit(lit) {
+  lampHeadMat.color.copy(lit ? LAMP_LIT : LAMP_UNLIT);
+}
 
 const _dummy = new THREE.Object3D();
 
@@ -161,8 +172,8 @@ export function buildChunkScenery(frames, halfRoadWidth, seed) {
       .addScaledVector(f.roadUp, -VERGE_DROP);
     const yaw = Math.atan2(f.right.x, f.right.z);
     poles.push({ pos: base.clone().setY(base.y + 2.6), yaw });
-    arms.push({ pos: base.clone().setY(base.y + 5.1).addScaledVector(f.right, -side * 0.75), yaw });
-    const headPos = base.clone().setY(base.y + 4.95).addScaledVector(f.right, -side * 1.45);
+    arms.push({ pos: base.clone().setY(base.y + 5.05).addScaledVector(f.right, -side * 0.8), yaw });
+    const headPos = base.clone().setY(base.y + 4.88).addScaledVector(f.right, -side * 1.55);
     heads.push({ pos: headPos, yaw });
   }
   addInstanced(group, poleGeo, poleMat, poles);

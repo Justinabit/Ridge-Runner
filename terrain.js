@@ -21,6 +21,15 @@ const LOAD_BEHIND = 300;         // road kept loaded behind before unloading
 // past for a frame. A slab gives the ray no "back side" to escape through.
 const SLAB_THICKNESS = 4;
 
+/* Per-shape materials. cannon-es resolves a contact material from the two
+ * SHAPES first and only falls back to the bodies, which lets the road surface
+ * and the guardrails behave completely differently while living on the same
+ * static body. Without this the barriers inherited the world default friction
+ * of 0.4 and a glancing hit brought the car to a dead stop instead of letting
+ * it slide along the rail. */
+export const ROAD_MATERIAL = new CANNON.Material('road');
+export const BARRIER_MATERIAL = new CANNON.Material('barrier');
+
 /* Guardrails. Previously these were decorative posts with no physics at all,
  * so nothing stopped the car leaving the road: once off the edge there was no
  * ground beneath it and it fell until the "out of the world" check fired. They
@@ -140,7 +149,9 @@ function buildChunk(chunkIndex) {
   }
 
   const roadBody = new CANNON.Body({ mass: 0 });
-  roadBody.addShape(new CANNON.Trimesh(physPositions, physIndices));
+  const roadShape = new CANNON.Trimesh(physPositions, physIndices);
+  roadShape.material = ROAD_MATERIAL;
+  roadBody.addShape(roadShape);
 
   // guardrails: one box per BARRIER_STEP segments, on both edges, added as
   // extra shapes on the same static body so no additional bodies are created
@@ -160,8 +171,10 @@ function buildChunk(chunkIndex) {
         .addScaledVector(right, BARRIER_THICKNESS / 2);
       const quat = orientAlong(dir);
 
+      const barrierShape = new CANNON.Box(new CANNON.Vec3(BARRIER_THICKNESS / 2, BARRIER_HEIGHT / 2, length / 2));
+      barrierShape.material = BARRIER_MATERIAL;
       roadBody.addShape(
-        new CANNON.Box(new CANNON.Vec3(BARRIER_THICKNESS / 2, BARRIER_HEIGHT / 2, length / 2)),
+        barrierShape,
         new CANNON.Vec3(mid.x, mid.y, mid.z),
         new CANNON.Quaternion(quat.x, quat.y, quat.z, quat.w)
       );

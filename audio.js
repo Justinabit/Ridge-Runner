@@ -20,6 +20,7 @@ export function createAudio() {
   // wind + tyres
   let noiseSrc = null, windFilter = null, windGain = null;
   let skidFilter = null, skidGain = null;
+  let scrapeFilter = null, scrapeGain = null;
   // shield hum
   let shieldOsc = null, shieldGain = null;
   // music
@@ -77,6 +78,14 @@ export function createAudio() {
     skidFilter.Q.value = 3;
     skidGain = ctx.createGain(); skidGain.gain.value = 0;
     noiseSrc.connect(skidFilter); skidFilter.connect(skidGain); skidGain.connect(master);
+
+    // metal-on-metal scrape: lower and harsher than the tyre squeal
+    scrapeFilter = ctx.createBiquadFilter();
+    scrapeFilter.type = 'bandpass';
+    scrapeFilter.frequency.value = 900;
+    scrapeFilter.Q.value = 1.4;
+    scrapeGain = ctx.createGain(); scrapeGain.gain.value = 0;
+    noiseSrc.connect(scrapeFilter); scrapeFilter.connect(scrapeGain); scrapeGain.connect(master);
     noiseSrc.start();
 
     /* ---- shield hum ---- */
@@ -129,7 +138,7 @@ export function createAudio() {
   }
 
   /** Called every frame with the current driving state. */
-  function update({ speed, throttle, grounded, sliding, shielded, boosting }, topSpeed) {
+  function update({ speed, throttle, grounded, sliding, shielded, boosting, scraping }, topSpeed) {
     if (!ctx || ctx.state !== 'running') return;
     const t = ctx.currentTime;
     const frac = Math.min(1, speed / topSpeed);
@@ -146,6 +155,9 @@ export function createAudio() {
 
     const skid = (sliding && grounded) ? 0.14 : 0;
     skidGain.gain.setTargetAtTime(muted ? 0 : skid, t, 0.05);
+
+    scrapeGain.gain.setTargetAtTime(muted ? 0 : (scraping ? 0.13 + frac * 0.09 : 0), t, 0.04);
+    if (scraping) scrapeFilter.frequency.setTargetAtTime(700 + frac * 1400, t, 0.08);
 
     shieldGain.gain.setTargetAtTime(muted ? 0 : (shielded ? 0.05 : 0), t, 0.15);
     if (shielded) shieldOsc.frequency.setTargetAtTime(320 + Math.sin(t * 3) * 25, t, 0.2);

@@ -2,6 +2,12 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 
 const CHASSIS_SIZE = new CANNON.Vec3(1.0, 0.35, 2.1);
+
+/* Paired with ROAD_MATERIAL / BARRIER_MATERIAL in terrain.js so the chassis can
+ * scrape along a guardrail rather than sticking to it. Wheel grip is unaffected:
+ * RaycastVehicle wheels are raycasts, and their traction comes from
+ * wheelInfo.frictionSlip, not from any contact material. */
+export const CHASSIS_MATERIAL = new CANNON.Material('chassis');
 const WHEEL_RADIUS = 0.45;
 
 /* ---------------------------------------------------------------------------
@@ -43,6 +49,7 @@ const STEER_RESPONSE = 0.0009;        // lerp base; smaller = snappier
 export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
   // ---------------- physics chassis ----------------
   const chassisShape = new CANNON.Box(CHASSIS_SIZE);
+  chassisShape.material = CHASSIS_MATERIAL;
   const chassisBody = new CANNON.Body({ mass: 165 });
   chassisBody.addShape(chassisShape);
   chassisBody.position.set(startPos.x, startPos.y, startPos.z);
