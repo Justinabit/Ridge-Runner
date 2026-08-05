@@ -12,8 +12,8 @@ import { hash1 } from './noise.js';
  * sees them in the same place and no state needs to be generated up front.
  * Only a window of cans around the car exists as meshes at any time. */
 
-const SPACING = 300;          // meters between cans
-const FUEL_PER_CAN = 25;      // percentage points restored
+const SPACING = 380;          // meters between cans
+const FUEL_PER_CAN = 22;      // percentage points restored
 const SCORE_PER_CAN = 100;
 const PICKUP_RADIUS = 4.0;    // generous, since you are travelling ~34 m/s
 const WINDOW_AHEAD = 900;

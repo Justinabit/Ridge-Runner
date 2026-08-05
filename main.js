@@ -96,8 +96,8 @@ let lastSpeed = 0;
  * tank in about 45 s and ending every run the same way. Burn is gentler now and
  * pickups.js scatters cans along the road, so fuel is a reason to keep moving
  * rather than a countdown you cannot affect. */
-const FUEL_IDLE_BURN = 0.9;      // per second
-const FUEL_THROTTLE_BURN = 0.7;  // extra per second at full throttle
+const FUEL_IDLE_BURN = 1.2;      // per second
+const FUEL_THROTTLE_BURN = 0.9;  // extra per second at full throttle
 
 /* ============================== BOOT ============================== */
 async function boot() {
