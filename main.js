@@ -5,33 +5,45 @@ import { createTerrainManager } from './terrain.js';
 import { createVehicle } from './vehicle.js';
 import { createCameraController } from './camera.js';
 import { createZoneManager } from './zones.js';
-import { createPickupManager } from './pickups.js';
+import { createPickupManager, PICKUP, FUEL_PER_CAN, BOOST_SECONDS, SHIELD_SECONDS, DOUBLE_SECONDS } from './pickups.js';
+import { createHazardManager, HAZARD, ROCK_DAMAGE, BARREL_DAMAGE, OIL_GRIP_PENALTY, OIL_SECONDS } from './hazards.js';
+import { createEffects } from './effects.js';
+import { createAudio } from './audio.js';
 
 /* ============================== DOM ============================== */
-const canvas = document.getElementById('game-canvas');
-const loadingScreen = document.getElementById('loading-screen');
-const loadingFill = document.getElementById('loading-fill');
-const loadingTip = document.getElementById('loading-tip');
-const startScreen = document.getElementById('start-screen');
-const startBtn = document.getElementById('start-btn');
-const hud = document.getElementById('hud');
-const crashScreen = document.getElementById('crash-screen');
-const retryBtn = document.getElementById('retry-btn');
-const cameraToggleBtn = document.getElementById('camera-toggle');
-const pauseScreen = document.getElementById('pause-screen');
+const $ = (id) => document.getElementById(id);
+const canvas = $('game-canvas');
+const loadingScreen = $('loading-screen');
+const loadingFill = $('loading-fill');
+const loadingTip = $('loading-tip');
+const startScreen = $('start-screen');
+const startBtn = $('start-btn');
+const hud = $('hud');
+const crashScreen = $('crash-screen');
+const retryBtn = $('retry-btn');
+const menuBtn = $('menu-btn');
+const resumeBtn = $('resume-btn');
+const quitBtn = $('quit-btn');
+const cameraToggleBtn = $('camera-toggle');
+const muteBtn = $('mute-toggle');
+const pauseScreen = $('pause-screen');
 
-const distanceEl = document.getElementById('hud-distance');
-const scoreEl = document.getElementById('hud-score');
-const bestEl = document.getElementById('hud-best');
-const speedFillEl = document.getElementById('speed-fill');
-const fuelFillEl = document.getElementById('fuel-fill');
-const zoneTagEl = document.getElementById('zone-tag');
-const airBadgeEl = document.getElementById('air-badge');
-const flipBadgeEl = document.getElementById('flip-badge');
-const fuelBadgeEl = document.getElementById('fuel-badge');
-const crashDistanceEl = document.getElementById('crash-distance');
-const crashScoreEl = document.getElementById('crash-score');
-const crashReasonEl = document.getElementById('crash-reason');
+const distanceEl = $('hud-distance');
+const scoreEl = $('hud-score');
+const bestEl = $('hud-best');
+const speedFillEl = $('speed-fill');
+const fuelFillEl = $('fuel-fill');
+const healthFillEl = $('health-fill');
+const zoneTagEl = $('zone-tag');
+const airBadgeEl = $('air-badge');
+const flipBadgeEl = $('flip-badge');
+const toastEl = $('toast');
+const powerRowEl = $('power-row');
+const crashDistanceEl = $('crash-distance');
+const crashScoreEl = $('crash-score');
+const crashBestEl = $('crash-best');
+const crashReasonEl = $('crash-reason');
+const flashEl = $('damage-flash');
 
 /* ============================== THREE SETUP ============================== */
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -51,53 +63,52 @@ window.addEventListener('resize', resize);
 resize();
 
 const SPAWN_Z = 20;
-
-// FIX: was 4 m, which dropped the car onto the road hard enough to bounce and
-// occasionally land badly before the player had touched anything. Now that
-// wheel raycasts actually detect the road (see roadgen's handedness fix) the
-// suspension settles on its own, so a small clearance is all that is needed.
 const SPAWN_HEIGHT_OFFSET = 1.5;
-
 const BEST_KEY = 'ridgerunner.best';
+const MAX_HEALTH = 100;
 
-/* ============================== LOADING HELPERS ============================== */
+/* ============================== STATE MACHINE ==============================
+ * Previously `started`, `gameOver` and `paused` were three loose booleans and
+ * Escape only toggled pause, with no way back to the menu. A single explicit
+ * state makes the legal transitions obvious and is what the Escape key needs. */
+const STATE = { LOADING: 'LOADING', MENU: 'MENU', PLAYING: 'PLAYING', PAUSED: 'PAUSED', OVER: 'OVER' };
+let state = STATE.LOADING;
+
+function setState(next) {
+  state = next;
+  startScreen.classList.toggle('hidden', next !== STATE.MENU);
+  hud.classList.toggle('hidden', next !== STATE.PLAYING && next !== STATE.PAUSED);
+  pauseScreen.classList.toggle('hidden', next !== STATE.PAUSED);
+  crashScreen.classList.toggle('hidden', next !== STATE.OVER);
+}
+
+/* ============================== HELPERS ============================== */
 function updateProgress(pct, tip) {
   loadingFill.style.width = Math.min(100, pct) + '%';
   if (tip) loadingTip.textContent = tip;
 }
 function yieldFrame() {
-  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
-
-function loadBest() {
-  try { return Number(localStorage.getItem(BEST_KEY)) || 0; } catch { return 0; }
-}
-function saveBest(v) {
-  try { localStorage.setItem(BEST_KEY, String(v)); } catch { /* private mode, ignore */ }
-}
+function loadBest() { try { return Number(localStorage.getItem(BEST_KEY)) || 0; } catch { return 0; } }
+function saveBest(v) { try { localStorage.setItem(BEST_KEY, String(v)); } catch { /* private mode */ } }
 
 /* ============================== GAME STATE ============================== */
-let world, terrain, vehicle, cameraController, zoneManager, pickups;
+let world, terrain, vehicle, cameraController, zoneManager, pickups, hazards, effects, audio;
 const keys = {};
 let fuel = 100;
+let health = MAX_HEALTH;
 let score = 0;
 let best = loadBest();
 let distance = SPAWN_Z;
-let started = false;
-let gameOver = false;
-let paused = false;
-
-// height of the road the last time the car was genuinely grounded, used by the
-// tunnelling safety net below
 let lastKnownGroundY = 0;
 let lastSpeed = 0;
 
-/* Fuel burn. The original drained ~2%/s with no way to refuel, emptying a full
- * tank in about 45 s and ending every run the same way. Burn is gentler now and
- * pickups.js scatters cans along the road, so fuel is a reason to keep moving
- * rather than a countdown you cannot affect. */
-const FUEL_IDLE_BURN = 1.2;      // per second
-const FUEL_THROTTLE_BURN = 0.9;  // extra per second at full throttle
+// power-up timers, in seconds remaining
+const timers = { boost: 0, shield: 0, double: 0, oil: 0 };
+
+const FUEL_IDLE_BURN = 1.2;
+const FUEL_THROTTLE_BURN = 0.9;
 
 /* ============================== BOOT ============================== */
 async function boot() {
@@ -108,46 +119,47 @@ async function boot() {
   world.broadphase = new CANNON.SAPBroadphase(world);
   world.solver.iterations = 12;
   world.defaultContactMaterial.friction = 0.4;
-  updateProgress(5, 'Setting up physics...');
+  updateProgress(6, 'Setting up physics...');
   await yieldFrame();
 
   terrain = createTerrainManager(scene, world);
   await terrain.ensureRange(SPAWN_Z, async (frac) => {
-    updateProgress(5 + frac * 55, 'Carving the mountain road...');
+    updateProgress(6 + frac * 52, 'Carving the mountain road...');
     await yieldFrame();
   });
-  updateProgress(60, 'Road complete');
+  updateProgress(58, 'Road complete');
   await yieldFrame();
 
-  updateProgress(64, 'Setting the sky...');
+  updateProgress(62, 'Setting the sky...');
   await yieldFrame();
   zoneManager = createZoneManager(scene);
-  updateProgress(78, 'Sky ready');
+  updateProgress(74, 'Sky ready');
   await yieldFrame();
 
-  updateProgress(80, 'Assembling the buggy...');
+  updateProgress(78, 'Assembling the buggy...');
   await yieldFrame();
-  const spawnSample = sampleRoad(SPAWN_Z);
-  const spawnPos = new THREE.Vector3(spawnSample.x, spawnSample.y + SPAWN_HEIGHT_OFFSET, spawnSample.z);
-  vehicle = createVehicle(world, spawnPos);
+  const s = sampleRoad(SPAWN_Z);
+  vehicle = createVehicle(world, new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, SPAWN_Z));
   scene.add(vehicle.sceneGroup);
-  lastKnownGroundY = spawnSample.y;
-  updateProgress(90, 'Buggy ready');
+  lastKnownGroundY = s.y;
+  updateProgress(88, 'Buggy ready');
   await yieldFrame();
 
   pickups = createPickupManager(scene);
+  hazards = createHazardManager(scene);
+  effects = createEffects(scene);
+  audio = createAudio();
   cameraController = createCameraController(camera);
   bindInput();
   updateProgress(100, 'Ready to ride!');
   await yieldFrame();
 
   loadingScreen.classList.add('hidden');
-  startScreen.classList.remove('hidden');
+  setState(STATE.MENU);
   requestAnimationFrame(animate);
 }
 
 /* ============================== INPUT ============================== */
-// keys the browser would otherwise act on (scrolling the page) while driving
 const SWALLOW = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space']);
 
 function bindInput() {
@@ -156,32 +168,38 @@ function bindInput() {
     if (e.repeat) return;
     keys[e.code] = true;
     if (e.code === 'KeyC') toggleCamera();
-    if (e.code === 'KeyR') resetVehicle();
-    if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
+    if (e.code === 'KeyR' && state === STATE.PLAYING) respawnPenalty();
+    if (e.code === 'KeyM') toggleMute();
+    if (e.code === 'KeyP') togglePause();
+    if (e.code === 'Escape') onEscape();
   });
   window.addEventListener('keyup', (e) => {
     if (SWALLOW.has(e.code)) e.preventDefault();
     keys[e.code] = false;
   });
-  // dropping focus (alt-tab) used to leave keys stuck down
   window.addEventListener('blur', () => { for (const k of Object.keys(keys)) keys[k] = false; });
 
   cameraToggleBtn.addEventListener('click', toggleCamera);
+  if (muteBtn) muteBtn.addEventListener('click', toggleMute);
 
   bindHoldButton('btn-gas', 'KeyW');
   bindHoldButton('btn-brake', 'KeyS');
   bindHoldButton('btn-left', 'KeyA');
   bindHoldButton('btn-right', 'KeyD');
 
-  startBtn.addEventListener('click', () => {
-    startScreen.classList.add('hidden');
-    hud.classList.remove('hidden');
-    started = true;
-  });
-  retryBtn.addEventListener('click', () => {
-    fullReset();
-    hud.classList.remove('hidden');
-  });
+  startBtn.addEventListener('click', () => { audio.start(); audio.uiClick(); beginRun(); });
+  retryBtn.addEventListener('click', () => { audio.uiClick(); beginRun(); });
+  if (menuBtn) menuBtn.addEventListener('click', () => { audio.uiClick(); toMenu(); });
+  if (resumeBtn) resumeBtn.addEventListener('click', () => { audio.uiClick(); togglePause(); });
+  if (quitBtn) quitBtn.addEventListener('click', () => { audio.uiClick(); toMenu(); });
+}
+
+/* Escape is context-sensitive: it pauses a run, and from the pause screen it
+ * goes back to the main menu. Previously it did nothing at all. */
+function onEscape() {
+  if (state === STATE.PLAYING) togglePause();
+  else if (state === STATE.PAUSED) toMenu();
+  else if (state === STATE.OVER) toMenu();
 }
 
 function toggleCamera() {
@@ -189,10 +207,15 @@ function toggleCamera() {
   cameraToggleBtn.textContent = cameraController.mode === 'chase' ? '\u{1F4F7}' : '\u{1F697}';
 }
 
+function toggleMute() {
+  if (!audio) return;
+  audio.setMuted(!audio.isMuted());
+  if (muteBtn) muteBtn.textContent = audio.isMuted() ? '\u{1F507}' : '\u{1F50A}';
+}
+
 function togglePause() {
-  if (!started || gameOver) return;
-  paused = !paused;
-  pauseScreen.classList.toggle('hidden', !paused);
+  if (state === STATE.PLAYING) setState(STATE.PAUSED);
+  else if (state === STATE.PAUSED) { setState(STATE.PLAYING); audio.resume(); }
 }
 
 function readControls() {
@@ -201,19 +224,19 @@ function readControls() {
   let lateral = 0;
   if (keys['KeyA'] || keys['ArrowLeft']) lateral -= 1;
   if (keys['KeyD'] || keys['ArrowRight']) lateral += 1;
-  const handbrake = !!keys['Space'];
-  // A/D now do double duty: they steer the front wheels on the ground and
-  // pitch the chassis in the air. vehicle.js decides which applies.
-  return { throttle, brake, steer: lateral, tilt: lateral, handbrake };
+  return {
+    throttle, brake,
+    steer: lateral, tilt: lateral,
+    handbrake: !!keys['Space'],
+    boost: timers.boost > 0,
+    gripScale: timers.oil > 0 ? OIL_GRIP_PENALTY : 1,
+  };
 }
 
-/* touch / pointer controls */
 function bindHoldButton(id, key) {
-  const el = document.getElementById(id);
+  const el = $(id);
   if (!el) return;
   const set = (v) => (keys[key] = v);
-  // FIX: only touchstart/touchend were bound, so the on-screen buttons did
-  // nothing for mouse or stylus users. Pointer events cover all three.
   el.addEventListener('pointerdown', (e) => { e.preventDefault(); set(true); el.setPointerCapture?.(e.pointerId); });
   el.addEventListener('pointerup', (e) => { e.preventDefault(); set(false); });
   el.addEventListener('pointercancel', () => set(false));
@@ -221,7 +244,7 @@ function bindHoldButton(id, key) {
   el.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
-/* ============================== RESET HELPERS ============================== */
+/* ============================== RUN LIFECYCLE ============================== */
 function respawnAt(z) {
   const s = sampleRoad(z);
   vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, z));
@@ -230,138 +253,216 @@ function respawnAt(z) {
   lastSpeed = 0;
 }
 
-function resetVehicle() {
-  if (!started) return;
+/** Manual respawn (R). Costs health, so it can't be used to cheese hazards. */
+function respawnPenalty() {
   respawnAt(Math.max(SPAWN_Z, distance - 15));
-  fuel = Math.max(fuel, 30);
-  gameOver = false;
-  crashScreen.classList.add('hidden');
-  // FIX: this hid the crash screen but never restored the HUD, so pressing R
-  // after a crash resumed play with no distance/score/speed/fuel readout.
-  hud.classList.remove('hidden');
+  health = Math.max(1, health - 10);
+  timers.oil = 0;
+  toast('RESPAWN  -10 HP');
 }
 
-function fullReset() {
+function beginRun() {
   respawnAt(SPAWN_Z);
   pickups.reset();
+  hazards.reset();
+  effects.reset();
   fuel = 100;
+  health = MAX_HEALTH;
   score = 0;
   distance = SPAWN_Z;
-  gameOver = false;
-  paused = false;
-  pauseScreen.classList.add('hidden');
-  crashScreen.classList.add('hidden');
+  timers.boost = timers.shield = timers.double = timers.oil = 0;
+  setState(STATE.PLAYING);
+  audio.start();
+  audio.resume();
+}
+
+function toMenu() {
+  setState(STATE.MENU);
+  respawnAt(SPAWN_Z);
+  distance = SPAWN_Z;
 }
 
 function endRun(reason) {
-  gameOver = true;
   if (score > best) { best = score; saveBest(best); }
   crashDistanceEl.textContent = Math.floor(distance - SPAWN_Z);
   crashScoreEl.textContent = score;
+  if (crashBestEl) crashBestEl.textContent = best;
   if (crashReasonEl) crashReasonEl.textContent = reason;
-  crashScreen.classList.remove('hidden');
-  hud.classList.add('hidden');
+  audio.crash();
+  cameraController.addTrauma(1);
+  setState(STATE.OVER);
+}
+
+function toast(text) {
+  if (!toastEl) return;
+  toastEl.textContent = text;
+  toastEl.classList.remove('hidden');
+  toastEl.style.animation = 'none';
+  void toastEl.offsetWidth;
+  toastEl.style.animation = '';
+  clearTimeout(toastEl._t);
+  toastEl._t = setTimeout(() => toastEl.classList.add('hidden'), 1100);
+}
+
+function damageFlash() {
+  if (!flashEl) return;
+  flashEl.style.animation = 'none';
+  void flashEl.offsetWidth;
+  flashEl.style.animation = 'dmg-flash 0.45s ease-out';
 }
 
 /* ============================== MAIN LOOP ============================== */
 const clock = new THREE.Clock();
-// FIX: halved from 1/60. Wheel contact is a raycast reaching ~1 m below each
-// wheel, so the shorter the step the less distance the car covers between
-// contact tests and the harder it is to slip through the road on a fast
-// landing. MAX_STEPS stops a stalled tab from trying to catch up all at once.
 const FIXED_DT = 1 / 120;
 const MAX_STEPS = 8;
 let accumulator = 0;
+const _fwd = new THREE.Vector3();
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
 
-  if (started && !gameOver && !paused) {
-    // stream chunks in around the car's ACTUAL position before stepping
-    // physics. FIX: this used to be passed `distance`, which only ever
-    // increases, so reversing or being knocked backwards could put the car on
-    // road that had already been unloaded.
-    const carZ = vehicle.chassisBody.position.z;
-    terrain.update(carZ, lastSpeed);
-
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= FIXED_DT && steps < MAX_STEPS) {
-      world.step(FIXED_DT);
-      accumulator -= FIXED_DT;
-      steps++;
-    }
-    if (steps === MAX_STEPS) accumulator = 0;
-
-    const controls = readControls();
-
-    // fuel is spent before physics consumes the throttle, so running dry
-    // actually affects this frame's driving
-    fuel = Math.max(0, fuel - dt * FUEL_IDLE_BURN - controls.throttle * dt * FUEL_THROTTLE_BURN);
-    if (fuel <= 0) controls.throttle *= 0.15;
-
-    const state = vehicle.update(controls, dt);
-    lastSpeed = state.speed;
-
-    const reward = pickups.update(state.position, dt);
-    if (reward.collected > 0) {
-      fuel = Math.min(100, fuel + reward.fuel);
-      score += reward.score;
-      showBadge(fuelBadgeEl);
-    }
-
-    distance = Math.max(distance, state.position.z);
-    score += Math.floor(state.speed * dt * 1.2);
-
-    if (!state.grounded) {
-      score += Math.floor(dt * 40); // air-time bonus
-    } else {
-      lastKnownGroundY = state.position.y;
-    }
-    if (state.justFlipped) {
-      score += 500;
-      showBadge(flipBadgeEl);
-    }
-
-    const zoneInfo = zoneManager.update(distance);
-    zoneManager.moveWithCar(vehicle.mesh.position);
-    zoneTagEl.textContent = zoneInfo.name;
-    vehicle.headlights.forEach((l) => { l.intensity = zoneInfo.isNight ? 3.2 : 0; });
-
-    cameraController.update(vehicle.mesh, state.speed, !state.grounded, dt);
-
-    // Safety net for physics tunnelling. A real jump never drops far below the
-    // terrain it left; a tunnelling bug free-falls well past it. Snap back onto
-    // the road rather than let it become a bogus "fell out of the world".
-    if (!state.grounded && state.airTime > 3 && state.position.y < lastKnownGroundY - 10) {
-      respawnAt(Math.max(SPAWN_Z, state.position.z));
-    } else if (state.position.y < lastKnownGroundY - 150) {
-      endRun('You went over the edge');
-    } else if (state.crashed) {
-      endRun('You landed on your roof');
-    }
-
-    updateHud(state);
+  if (state === STATE.PLAYING) {
+    step(dt);
+  } else if (state === STATE.MENU) {
+    // slow idle orbit behind the parked car, so the menu isn't a static image
+    const t = performance.now() * 0.00016;
+    const s = sampleRoad(SPAWN_Z);
+    camera.position.set(s.x + Math.sin(t) * 15, s.y + 6, s.z + Math.cos(t) * 15);
+    camera.lookAt(s.x, s.y + 1, s.z);
+    zoneManager.moveWithCar(new THREE.Vector3(s.x, s.y, s.z));
   }
 
   renderer.render(scene, camera);
 }
 
-function updateHud(state) {
+function step(dt) {
+  const carZ = vehicle.chassisBody.position.z;
+  terrain.update(carZ, lastSpeed);
+
+  accumulator += dt;
+  let steps = 0;
+  while (accumulator >= FIXED_DT && steps < MAX_STEPS) {
+    world.step(FIXED_DT);
+    accumulator -= FIXED_DT;
+    steps++;
+  }
+  if (steps === MAX_STEPS) accumulator = 0;
+
+  // tick power-up timers
+  for (const k of Object.keys(timers)) timers[k] = Math.max(0, timers[k] - dt);
+
+  const controls = readControls();
+
+  fuel = Math.max(0, fuel - dt * FUEL_IDLE_BURN - controls.throttle * dt * FUEL_THROTTLE_BURN);
+  if (fuel <= 0) controls.throttle *= 0.15;
+
+  const st = vehicle.update(controls, dt);
+  lastSpeed = st.speed;
+
+  /* ---- pickups ---- */
+  const { taken } = pickups.update(st.position, dt, performance.now());
+  for (const type of taken) {
+    audio.pickup(type);
+    if (type === PICKUP.FUEL) { fuel = Math.min(100, fuel + FUEL_PER_CAN); toast('FUEL +' + FUEL_PER_CAN); }
+    else if (type === PICKUP.BOOST) { timers.boost = BOOST_SECONDS; audio.boostStart(); toast('BOOST!'); }
+    else if (type === PICKUP.SHIELD) { timers.shield = SHIELD_SECONDS; toast('SHIELD UP'); }
+    else if (type === PICKUP.DOUBLE) { timers.double = DOUBLE_SECONDS; toast('DOUBLE SCORE'); }
+    score += 60;
+  }
+
+  /* ---- hazards ---- */
+  const { impacts, onOil } = hazards.update(st.position);
+  if (onOil) timers.oil = OIL_SECONDS;
+  for (const h of impacts) {
+    const dmg = h === HAZARD.ROCK ? ROCK_DAMAGE : BARREL_DAMAGE;
+    effects.impactSparks(st.position);
+    if (timers.shield > 0) {
+      audio.impact(0.6);
+      cameraController.addTrauma(0.35);
+      toast('SHIELD ABSORBED');
+    } else {
+      health -= dmg;
+      audio.impact(1);
+      cameraController.addTrauma(0.75);
+      damageFlash();
+      // knock the car off line, so a hit costs you time as well as health
+      const b = vehicle.chassisBody;
+      b.angularVelocity.y += (Math.random() - 0.5) * 5;
+      b.velocity.scale(0.72, b.velocity);
+    }
+  }
+
+  /* ---- scoring ---- */
+  const mult = timers.double > 0 ? 2 : 1;
+  distance = Math.max(distance, st.position.z);
+  score += Math.floor(st.speed * dt * 1.2) * mult;
+  if (!st.grounded) score += Math.floor(dt * 40) * mult;
+  else lastKnownGroundY = st.position.y;
+  if (st.justFlipped) { score += 500 * mult; showBadge(flipBadgeEl); audio.pickup('BOOST'); }
+
+  /* ---- world / camera / effects ---- */
+  const zoneInfo = zoneManager.update(distance);
+  zoneManager.moveWithCar(vehicle.mesh.position);
+  zoneTagEl.textContent = zoneInfo.name;
+  // FIX: headlights were 3.2 with a 40 m throw, which at 34 m/s lit barely a
+  // second of road. Brighter and much further now, and they stay dimly on by
+  // day so the car reads as a vehicle rather than a box.
+  vehicle.headlights.forEach((l) => {
+    l.intensity = zoneInfo.isNight ? 6.5 : 0.35;
+    l.distance = zoneInfo.isNight ? 110 : 40;
+  });
+
+  effects.wheelDust(st.wheelPositions, st.speed, st.grounded, dt);
+  if (timers.boost > 0) {
+    _fwd.set(0, 0, 1).applyQuaternion(vehicle.mesh.quaternion);
+    effects.boostTrail(st.position, _fwd, dt);
+  }
+  effects.update(dt);
+
+  cameraController.setBoost(timers.boost > 0);
+  cameraController.update(vehicle.mesh, st.speed, !st.grounded, dt);
+
+  audio.update({
+    speed: st.speed, throttle: controls.throttle, grounded: st.grounded,
+    sliding: st.sliding, shielded: timers.shield > 0, boosting: timers.boost > 0,
+  }, st.topSpeed);
+
+  /* ---- end conditions ---- */
+  if (!st.grounded && st.airTime > 3 && st.position.y < lastKnownGroundY - 10) {
+    respawnAt(Math.max(SPAWN_Z, st.position.z));
+  } else if (health <= 0) {
+    endRun('Your buggy fell apart');
+  } else if (st.position.y < lastKnownGroundY - 150) {
+    endRun('You went over the edge');
+  } else if (st.crashed) {
+    endRun('You landed on your roof');
+  }
+
+  updateHud(st);
+}
+
+function updateHud(st) {
   distanceEl.innerHTML = Math.floor(distance - SPAWN_Z) + '<span class="hud-unit">m</span>';
   scoreEl.textContent = score;
   if (bestEl) bestEl.textContent = Math.max(best, score);
-  const speedKmh = state.speed * 3.6;
-  speedFillEl.style.width = Math.min(100, (speedKmh / 140) * 100) + '%';
+  speedFillEl.style.width = Math.min(100, (st.speed * 3.6 / 200) * 100) + '%';
   fuelFillEl.style.width = fuel + '%';
   fuelFillEl.style.background = fuel < 20 ? 'var(--fuel-color-low)' : 'var(--fuel-color)';
-
-  if (!state.grounded && state.airTime > 0.45) {
-    airBadgeEl.classList.remove('hidden');
-  } else {
-    airBadgeEl.classList.add('hidden');
+  if (healthFillEl) {
+    healthFillEl.style.width = Math.max(0, health) + '%';
+    healthFillEl.style.background = health < 30 ? 'var(--fuel-color-low)' : 'var(--health-color)';
   }
+
+  if (powerRowEl) {
+    powerRowEl.innerHTML =
+      (timers.boost > 0 ? `<span class="pip pip-boost">BOOST ${timers.boost.toFixed(1)}</span>` : '') +
+      (timers.shield > 0 ? `<span class="pip pip-shield">SHIELD ${timers.shield.toFixed(1)}</span>` : '') +
+      (timers.double > 0 ? `<span class="pip pip-double">2x ${timers.double.toFixed(1)}</span>` : '') +
+      (timers.oil > 0 ? `<span class="pip pip-oil">NO GRIP</span>` : '');
+  }
+
+  airBadgeEl.classList.toggle('hidden', !(!st.grounded && st.airTime > 0.45));
 }
 
 function showBadge(el) {

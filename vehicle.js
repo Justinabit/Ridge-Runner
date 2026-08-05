@@ -148,6 +148,7 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
   let flipAccum = 0;
   let wasGrounded = true;
   let steer = 0;
+  let lastGripScale = 1;
   const upsideDownTimer = { t: 0 };
 
   // scratch vectors reused every frame so the loop allocates nothing
@@ -207,7 +208,17 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
      *
      * Lock falls off with speed: full lock at 120 km/h would spin or roll the
      * car, and it makes small high-speed corrections feel twitchy. */
-    const speedFrac = THREE.MathUtils.clamp(Math.abs(forwardSpeed) / TOP_SPEED, 0, 1);
+    // power-ups and hazards can scale grip and top speed for a while
+    const boost = controls.boost ? 1 : 0;
+    const topSpeed = TOP_SPEED * (boost ? 1.28 : 1);
+    const gripScale = controls.gripScale ?? 1;
+    if (gripScale !== lastGripScale) {
+      const g = 3.2 * gripScale;
+      for (const w of vehicle.wheelInfos) w.frictionSlip = g;
+      lastGripScale = gripScale;
+    }
+
+    const speedFrac = THREE.MathUtils.clamp(Math.abs(forwardSpeed) / topSpeed, 0, 1);
     const steerLimit = MAX_STEER * (1 - STEER_SPEED_FALLOFF * speedFrac);
     // SIGN: the car drives toward +Z and the camera sits behind it looking the
     // same way, which puts world +X on the LEFT of the screen. A right-handed
@@ -228,8 +239,8 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
      * direction terrain streams in. Verified in simulation rather than assumed;
      * the original sign was correct and is deliberately unchanged. */
     let engineForce = 0;
-    if (controls.throttle > 0 && forwardSpeed < TOP_SPEED) {
-      engineForce = -controls.throttle * MAX_ENGINE_FORCE;
+    if (controls.throttle > 0 && forwardSpeed < topSpeed) {
+      engineForce = -controls.throttle * MAX_ENGINE_FORCE * (boost ? 1.45 : 1);
     } else if (controls.brake > 0 && forwardSpeed < 0.5 && forwardSpeed > -REVERSE_TOP_SPEED) {
       // brake doubles as reverse once essentially stopped, so a bad landing
       // against a barrier is recoverable instead of stranding the player
@@ -251,7 +262,17 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
     const v = chassisBody.velocity;
     const speed = v.length();
     if (speed > 0.01) {
-      const dragMag = DRAG_COEFF * speed * speed + (grounded ? ROLLING_RESISTANCE : 0);
+      // Gravity on a downhill can push the car well past its notional top
+      // speed, and boost made that much worse: measured 220 km/h, enough to
+      // launch clean over the guardrails and trigger the fall-through safety
+      // net eight times in a four-minute run. Rather than hard-clamping the
+      // velocity (which fights the solver and feels like hitting a wall), any
+      // excess over topSpeed gets its own steep quadratic drag term, which
+      // pulls the car back down smoothly.
+      const over = Math.max(0, speed - topSpeed);
+      const dragMag = DRAG_COEFF * speed * speed * (boost ? 0.78 : 1)
+        + over * over * 20
+        + (grounded ? ROLLING_RESISTANCE : 0);
       v.scale(-dragMag / speed, _drag);
       // NOTE: applyForce's second argument is a point RELATIVE to the centre of
       // mass, not a world position. Passing the body's world position here makes
@@ -306,9 +327,17 @@ export function createVehicle(world, startPos = new THREE.Vector3(0, 6, 0)) {
       wheelMeshes[i].quaternion.copy(t.quaternion);
     }
 
+    // any wheel exceeding its friction budget counts as sliding, which drives
+    // the tyre-squeal audio and the dust effect
+    let sliding = false;
+    for (const w of vehicle.wheelInfos) if (w.sliding) { sliding = true; break; }
+
     return {
       speed,
       forwardSpeed,
+      sliding,
+      topSpeed,
+      wheelPositions: vehicle.wheelInfos.map((w) => w.worldTransform.position),
       grounded,
       airTime,
       crashed,

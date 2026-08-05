@@ -2,65 +2,102 @@ import * as THREE from 'three';
 import { sampleRoad } from './roadgen.js';
 import { hash1 } from './noise.js';
 
-/* Fuel cans.
+/* Pickups: fuel plus three power-ups.
  *
- * The original game drained a full tank in about 45 seconds and offered no way
- * to top it up, so every run ended the same way: the throttle quietly cut to
- * 15% and the car rolled to a stop. Fuel was a countdown, not a mechanic.
- *
- * Cans are placed deterministically from the road function, so every player
- * sees them in the same place and no state needs to be generated up front.
- * Only a window of cans around the car exists as meshes at any time. */
+ * Placement is a pure function of the road, so every player sees the same
+ * layout, nothing needs generating up front, and the sequence continues
+ * forever. Only a window around the car exists as meshes at any time. */
 
-const SPACING = 380;          // meters between cans
-const FUEL_PER_CAN = 22;      // percentage points restored
-const SCORE_PER_CAN = 100;
-const PICKUP_RADIUS = 4.0;    // generous, since you are travelling ~34 m/s
+export const PICKUP = {
+  FUEL: 'FUEL',
+  BOOST: 'BOOST',
+  SHIELD: 'SHIELD',
+  DOUBLE: 'DOUBLE',
+};
+
+const SPACING = 190;          // metres between pickups of any kind
+const PICKUP_RADIUS = 4.2;
 const WINDOW_AHEAD = 900;
 const WINDOW_BEHIND = 120;
 
-const canMat = new THREE.MeshLambertMaterial({ color: 0xf5c542, flatShading: true });
-const capMat = new THREE.MeshLambertMaterial({ color: 0x2a2233, flatShading: true });
+export const FUEL_PER_CAN = 22;
+export const BOOST_SECONDS = 5;
+export const SHIELD_SECONDS = 8;
+export const DOUBLE_SECONDS = 10;
+
+const MATS = {
+  [PICKUP.FUEL]: new THREE.MeshLambertMaterial({ color: 0xf5c542, flatShading: true }),
+  [PICKUP.BOOST]: new THREE.MeshLambertMaterial({ color: 0xff5a3d, flatShading: true }),
+  [PICKUP.SHIELD]: new THREE.MeshLambertMaterial({ color: 0x4fc3ff, flatShading: true }),
+  [PICKUP.DOUBLE]: new THREE.MeshLambertMaterial({ color: 0xb45cff, flatShading: true }),
+};
+const GLOW = {
+  [PICKUP.FUEL]: 0xffe08a,
+  [PICKUP.BOOST]: 0xff9b7a,
+  [PICKUP.SHIELD]: 0x9fe4ff,
+  [PICKUP.DOUBLE]: 0xd9a4ff,
+};
+
 const canGeo = new THREE.BoxGeometry(0.7, 0.95, 0.45);
 const capGeo = new THREE.BoxGeometry(0.22, 0.2, 0.22);
-const glowGeo = new THREE.SphereGeometry(0.9, 8, 6);
-const glowMat = new THREE.MeshBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.18 });
+const boostGeo = new THREE.ConeGeometry(0.5, 1.1, 5);
+const shieldGeo = new THREE.OctahedronGeometry(0.62, 0);
+const doubleGeo = new THREE.TorusGeometry(0.45, 0.17, 6, 10);
+const capMat = new THREE.MeshLambertMaterial({ color: 0x2a2233, flatShading: true });
+const glowGeo = new THREE.SphereGeometry(0.95, 8, 6);
 
-function makeCan() {
+function makeMesh(type) {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(canGeo, canMat);
+  let body;
+  if (type === PICKUP.FUEL) {
+    body = new THREE.Mesh(canGeo, MATS[type]);
+    const cap = new THREE.Mesh(capGeo, capMat);
+    cap.position.set(0, 0.57, 0);
+    g.add(cap);
+  } else if (type === PICKUP.BOOST) {
+    body = new THREE.Mesh(boostGeo, MATS[type]);
+  } else if (type === PICKUP.SHIELD) {
+    body = new THREE.Mesh(shieldGeo, MATS[type]);
+  } else {
+    body = new THREE.Mesh(doubleGeo, MATS[type]);
+  }
   body.castShadow = true;
-  const cap = new THREE.Mesh(capGeo, capMat);
-  cap.position.set(0, 0.57, 0);
-  const glow = new THREE.Mesh(glowGeo, glowMat);
-  g.add(body, cap, glow);
+  const glow = new THREE.Mesh(glowGeo, new THREE.MeshBasicMaterial({
+    color: GLOW[type], transparent: true, opacity: 0.2, depthWrite: false,
+  }));
+  g.add(body, glow);
+  g.userData.type = type;
   return g;
 }
 
-/** Index of the first can at or after z. */
-function canIndexAfter(z) {
-  return Math.ceil(z / SPACING);
+/* Fuel dominates the sequence because it is the survival resource; power-ups
+ * are the reward for going further. */
+function typeForIndex(i) {
+  const h = hash1(i * 3.77 + 11.3);
+  if (i % 3 === 0) return PICKUP.FUEL;      // guaranteed fuel cadence
+  if (h < 0.42) return PICKUP.FUEL;
+  if (h < 0.66) return PICKUP.BOOST;
+  if (h < 0.86) return PICKUP.SHIELD;
+  return PICKUP.DOUBLE;
 }
 
-/** Deterministic world position of can `i`. */
-function canPosition(i) {
+function positionFor(i) {
   const z = i * SPACING;
   const s = sampleRoad(z);
-  // nudge it off centre a little, but keep it well inside the 9 m road
-  const lateral = (hash1(i * 7.31) - 0.5) * 4.2;
-  return new THREE.Vector3(s.x + lateral, s.y + 1.0, z);
+  const lateral = (hash1(i * 7.31) - 0.5) * 4.6;
+  return new THREE.Vector3(s.x + lateral, s.y + 1.05, z);
 }
 
 export function createPickupManager(scene) {
-  const active = new Map();      // index -> THREE.Group
-  const collected = new Set();   // indices taken during this run
+  const active = new Map();
+  const collected = new Set();
   const group = new THREE.Group();
   scene.add(group);
 
   function spawn(i) {
     if (i < 1 || active.has(i) || collected.has(i)) return;
-    const mesh = makeCan();
-    mesh.position.copy(canPosition(i));
+    const mesh = makeMesh(typeForIndex(i));
+    mesh.position.copy(positionFor(i));
     group.add(mesh);
     active.set(i, mesh);
   }
@@ -73,35 +110,34 @@ export function createPickupManager(scene) {
   }
 
   /**
-   * @returns {{fuel:number, score:number, collected:number}} rewards earned this frame
+   * @param {{x:number,y:number,z:number}} carPos
+   * @param {number} magnetRadius unused hook, kept at 0
+   * @returns {{taken: string[]}} pickup types collected this frame
    */
-  function update(carPos, dt) {
-    const first = canIndexAfter(carPos.z - WINDOW_BEHIND);
-    const last = canIndexAfter(carPos.z + WINDOW_AHEAD);
+  function update(carPos, dt, t) {
+    const first = Math.ceil((carPos.z - WINDOW_BEHIND) / SPACING);
+    const last = Math.ceil((carPos.z + WINDOW_AHEAD) / SPACING);
     for (let i = first; i <= last; i++) spawn(i);
 
-    let fuel = 0, score = 0, taken = 0;
-
+    const taken = [];
     for (const [i, mesh] of Array.from(active)) {
       if (mesh.position.z < carPos.z - WINDOW_BEHIND || mesh.position.z > carPos.z + WINDOW_AHEAD) {
         despawn(i);
         continue;
       }
-      mesh.rotation.y += dt * 1.6;
-      mesh.position.y = canPosition(i).y + Math.sin(performance.now() * 0.003 + i) * 0.12;
+      mesh.rotation.y += dt * 1.7;
+      mesh.position.y = positionFor(i).y + Math.sin(t * 0.003 + i) * 0.14;
 
       const dx = mesh.position.x - carPos.x;
       const dy = mesh.position.y - carPos.y;
       const dz = mesh.position.z - carPos.z;
       if (dx * dx + dz * dz < PICKUP_RADIUS * PICKUP_RADIUS && Math.abs(dy) < 3.5) {
+        taken.push(mesh.userData.type);
         collected.add(i);
         despawn(i);
-        fuel += FUEL_PER_CAN;
-        score += SCORE_PER_CAN;
-        taken++;
       }
     }
-    return { fuel, score, collected: taken };
+    return { taken };
   }
 
   function reset() {

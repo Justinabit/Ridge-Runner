@@ -29,8 +29,27 @@ Then open <http://localhost:8000>.
 | `A` / `D` | Steer on the ground, tilt the chassis in the air |
 | `Space` | Handbrake (rear axle only, so it slides) |
 | `C` | Toggle chase / cockpit camera |
-| `R` | Respawn on the road just behind you |
-| `P` / `Esc` | Pause |
+| `M` | Mute |
+| `R` | Respawn just behind you, at the cost of 10 hull |
+| `P` | Pause |
+| `Esc` | Pause; from the pause or crash screen, back to the main menu |
+
+## Playing
+
+Survive as long as you can. Two resources run against you:
+
+- **Fuel** burns constantly and faster on the throttle. Yellow cans restore it.
+  Collecting every can is roughly break-even at speed, so missing them is what
+  kills you.
+- **Hull** only ever goes down. Rocks and barrels damage it; oil slicks don't
+  damage you but strip your grip for a moment, which is often worse.
+
+| Pickup | Effect |
+| --- | --- |
+| Yellow can | +22% fuel |
+| Orange cone | Speed boost for 5s |
+| Blue octahedron | Shield for 8s, absorbs hazard hits |
+| Purple ring | Double score for 10s |
 
 On touch devices the four on-screen buttons map to the same controls.
 
@@ -44,7 +63,11 @@ On touch devices the four on-screen buttons map to the same controls.
 | `vehicle.js` | Chassis, wheels, steering, drivetrain, crash detection |
 | `camera.js` | Chase and cockpit cameras |
 | `zones.js` | Sky, lighting, fog and scenery per biome |
-| `pickups.js` | Fuel cans |
+| `pickups.js` | Fuel and power-up pickups |
+| `hazards.js` | Rocks, barrels and oil slicks |
+| `scenery.js` | Roadside trees, rocks, grass and street lamps |
+| `effects.js` | Pooled particle systems (dust, sparks, boost trail) |
+| `audio.js` | Procedural Web Audio: engine, wind, skid, music, one-shots |
 | `noise.js` | Deterministic value noise |
 
 The road is never stored, only sampled. `roadgen.js` maps a distance `z` to a
@@ -75,10 +98,30 @@ falls straight through the world.
   of mass**, not a world position. Passing a world position fabricates enormous
   torque and destroys the simulation.
 
+### Audio
+
+`audio.js` synthesises everything at runtime — there are no sound files. The
+engine is two detuned oscillators through a lowpass that opens with revs, wind
+and tyre squeal are one noise source through two bandpass filters, and the music
+is a scheduled arpeggio. Browsers block audio until a user gesture, so the
+context is created on the first click of START and every method is a no-op
+before then.
+
 ## Testing
 
 Physics changes are easy to get wrong and hard to eyeball, so they are worth
-checking headlessly. `cannon-es` and the geometry modules run fine under Node —
-you can import `roadgen.js`, `terrain.js` and `vehicle.js` directly, step the
-world in a loop with a simple autopilot, and assert that the car stays on the
-road and never drops below it.
+checking headlessly. `cannon-es` and the geometry modules run fine under Node:
+import `roadgen.js`, `terrain.js` and `vehicle.js` directly, step the world in a
+loop with a simple autopilot, and assert the car stays on the road.
+
+Two things that caught real bugs here and are worth keeping in mind:
+
+- **`node --check` is not a syntax gate for this project.** It parses files as
+  CommonJS scripts, and it happily accepted a full-width Unicode digit that made
+  `camera.js` fail to import. Parse with `acorn` using `sourceType: 'module'`,
+  or just `import()` the module.
+- **Assert against the screen, not the world.** Steering was verified as
+  "positive steer moves the car toward +X" and shipped inverted, because the car
+  drives along +Z with the camera behind it, which puts +X on the *left* of the
+  screen. The control test now projects the car's displacement onto the camera's
+  screen-right vector instead.

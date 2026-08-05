@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { sampleRoadFrame, ROAD_WIDTH } from './roadgen.js';
+import { buildChunkScenery, VERGE_WIDTH } from './scenery.js';
+import { groundTintAt } from './zones.js';
+import { hash1 } from './noise.js';
 
 const CHUNK_LENGTH = 120;       // meters of road per chunk
 // FIX: raised from 10. At 12 m per segment the ribbon cut visible corners on
@@ -28,7 +31,11 @@ const BARRIER_THICKNESS = 0.4;
 const BARRIER_STEP = 2;          // one barrier box per N road segments
 
 const roadMat = new THREE.MeshLambertMaterial({ color: 0x4a4453, flatShading: true });
-const shoulderMat = new THREE.MeshLambertMaterial({ color: 0x6b4a34, flatShading: true });
+// FIX: the shoulder was a flat dirt strip in a single hard-coded brown, and
+// each zone's `groundTint` was declared but never used anywhere. The verge now
+// takes its colour from groundTintAt(z), so the ground turns sandy at the beach
+// and dark at night along with the sky.
+const shoulderMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
 const barrierMat = new THREE.MeshLambertMaterial({ color: 0xf2f0e6, flatShading: true });
 const barrierGeo = new THREE.BoxGeometry(1, 1, 1);
 
@@ -37,6 +44,7 @@ const _xAxis = new THREE.Vector3();
 const _yAxis = new THREE.Vector3();
 const _zAxis = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
+const _tint = new THREE.Color();
 
 /** Orientation whose local +Z runs along `dir` and whose local +Y is roughly up. */
 function orientAlong(dir) {
@@ -57,6 +65,8 @@ function buildChunk(chunkIndex) {
   const indices = [];
   const shoulderPositions = [];
   const shoulderIndices = [];
+  const shoulderColors = [];
+  const frames = [];
   const leftEdge = [];
   const rightEdge = [];
   const ups = [];
@@ -66,6 +76,7 @@ function buildChunk(chunkIndex) {
     // the identical z at their shared boundary, so chunks meet with no seam.
     const z = startZ + (i / SEGMENTS_PER_CHUNK) * CHUNK_LENGTH;
     const frame = sampleRoadFrame(z);
+    frames.push(frame);
     const halfW = ROAD_WIDTH / 2;
     const l = frame.center.clone().addScaledVector(frame.right, -halfW);
     const r = frame.center.clone().addScaledVector(frame.right, halfW);
@@ -77,10 +88,15 @@ function buildChunk(chunkIndex) {
     normals.push(frame.roadUp.x, frame.roadUp.y, frame.roadUp.z, frame.roadUp.x, frame.roadUp.y, frame.roadUp.z);
     uvs.push(0, z * 0.15, 1, z * 0.15);
 
-    const shHalfW = halfW + 5;
-    const sl = frame.center.clone().addScaledVector(frame.right, -shHalfW).addScaledVector(frame.roadUp, -0.15);
-    const sr = frame.center.clone().addScaledVector(frame.right, shHalfW).addScaledVector(frame.roadUp, -0.15);
+    const shHalfW = halfW + VERGE_WIDTH;
+    const sl = frame.center.clone().addScaledVector(frame.right, -shHalfW).addScaledVector(frame.roadUp, -0.18);
+    const sr = frame.center.clone().addScaledVector(frame.right, shHalfW).addScaledVector(frame.roadUp, -0.18);
     shoulderPositions.push(sl.x, sl.y, sl.z, l.x, l.y, l.z, r.x, r.y, r.z, sr.x, sr.y, sr.z);
+
+    groundTintAt(z, _tint);
+    // vary the grass slightly so the verge is not a flat sheet of one colour
+    const v = 0.82 + 0.36 * hash1(z * 0.37);
+    for (let k = 0; k < 4; k++) shoulderColors.push(_tint.r * v, _tint.g * v, _tint.b * v);
 
     if (i < SEGMENTS_PER_CHUNK) {
       const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
@@ -101,6 +117,7 @@ function buildChunk(chunkIndex) {
 
   const shoulderGeo = new THREE.BufferGeometry();
   shoulderGeo.setAttribute('position', new THREE.Float32BufferAttribute(shoulderPositions, 3));
+  shoulderGeo.setAttribute('color', new THREE.Float32BufferAttribute(shoulderColors, 3));
   shoulderGeo.setIndex(shoulderIndices);
   shoulderGeo.computeVertexNormals();
   const shoulderMesh = new THREE.Mesh(shoulderGeo, shoulderMat);
@@ -167,7 +184,12 @@ function buildChunk(chunkIndex) {
   const group = new THREE.Group();
   group.add(shoulderMesh, roadMesh, barrierInst);
 
-  return { mesh: group, physicsBody: roadBody };
+  // roadside dressing, placed from the same frames the road was built from so
+  // every prop sits on the verge rather than hanging in the void
+  const scenery = buildChunkScenery(frames, ROAD_WIDTH / 2, chunkIndex);
+  group.add(scenery.group);
+
+  return { mesh: group, physicsBody: roadBody, lampPositions: scenery.lampPositions };
 }
 
 export function createTerrainManager(scene, world) {
