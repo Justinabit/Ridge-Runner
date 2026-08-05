@@ -334,3 +334,58 @@ html, body {
 @media (prefers-reduced-motion: reduce) {
   .air-badge, .flip-badge { animation: none; opacity: 0; }
 }
+/* ===== added: best-score panel, pause overlay, fuel badge, crash reason ===== */
+.controls-note {
+  margin-top: 0.6rem;
+  opacity: 0.75;
+  font-style: italic;
+}
+
+#pause-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  background: rgba(12, 9, 20, 0.72);
+  backdrop-filter: blur(3px);
+}
+.pause-title {
+  font-family: 'Bungee', cursive;
+  font-size: clamp(2.2rem, 8vw, 4.5rem);
+  color: var(--cream);
+  letter-spacing: 0.06em;
+}
+.pause-sub {
+  color: var(--cream);
+  opacity: 0.85;
+  font-size: 1rem;
+}
+
+.crash-reason {
+  color: var(--cream);
+  opacity: 0.85;
+  margin-bottom: 0.4rem;
+  font-size: 1.05rem;
+}
+
+.fuel-badge {
+  position: fixed;
+  left: 50%;
+  top: 42%;
+  transform: translate(-50%, -50%);
+  z-index: 24;
+  padding: 0.5rem 1.1rem;
+  border-radius: 999px;
+  border: 2px solid var(--panel-border);
+  background: var(--panel-bg);
+  color: #ffe08a;
+  font-family: 'Bungee', cursive;
+  font-size: clamp(1rem, 3.2vw, 1.6rem);
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  animation: pop-fade 0.9s ease-out forwards;
+}

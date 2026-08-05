@@ -23,7 +23,7 @@
   <div id="loading-screen">
     <div class="loading-title">RIDGE<span>RUNNER</span></div>
     <div class="loading-bar"><div class="loading-bar-fill" id="loading-fill"></div></div>
-    <div class="loading-tip" id="loading-tip">TIP: TILT IN THE AIR TO STICK YOUR LANDING</div>
+    <div class="loading-tip" id="loading-tip">TIP: GRAB FUEL CANS TO KEEP YOUR RUN ALIVE</div>
   </div>
 
   <!-- ===== START OVERLAY ===== -->
@@ -32,9 +32,11 @@
     <div class="start-sub">a low&#8209;poly hill&#8209;climb</div>
     <button id="start-btn" class="chunky-btn">START ENGINE</button>
     <div class="controls-hint">
-      <div><b>W / &uarr;</b> gas &nbsp; <b>S / &darr;</b> brake</div>
-      <div><b>A / D</b> tilt in air &nbsp; <b>SPACE</b> handbrake</div>
-      <div><b>C</b> camera &nbsp; <b>R</b> reset</div>
+      <div><b>W / &uarr;</b> gas &nbsp; <b>S / &darr;</b> brake &amp; reverse</div>
+      <div><b>A / D</b> steer &mdash; and tilt while airborne</div>
+      <div><b>SPACE</b> handbrake &nbsp; <b>C</b> camera</div>
+      <div><b>R</b> respawn &nbsp; <b>P</b> pause</div>
+      <div class="controls-note">Collect yellow fuel cans. Stay on the road.</div>
     </div>
   </div>
 
@@ -48,6 +50,10 @@
       <div class="hud-panel">
         <div class="hud-label">SCORE</div>
         <div class="hud-value" id="hud-score">0</div>
+      </div>
+      <div class="hud-panel">
+        <div class="hud-label">BEST</div>
+        <div class="hud-value" id="hud-best">0</div>
       </div>
     </div>
 
@@ -69,6 +75,7 @@
 
     <div class="air-badge hidden" id="air-badge">AIRBORNE!</div>
     <div class="flip-badge hidden" id="flip-badge">FLIP! +500</div>
+    <div class="fuel-badge hidden" id="fuel-badge">FUEL +25</div>
   </div>
 
   <!-- ===== TOUCH CONTROLS ===== -->
@@ -79,9 +86,16 @@
     <div class="touch-btn" id="btn-gas">&#9650;</div>
   </div>
 
+  <!-- ===== PAUSE OVERLAY ===== -->
+  <div id="pause-screen" class="hidden">
+    <div class="pause-title">PAUSED</div>
+    <div class="pause-sub">press <b>P</b> or <b>ESC</b> to resume</div>
+  </div>
+
   <!-- ===== CRASH / GAME OVER OVERLAY ===== -->
   <div id="crash-screen" class="hidden">
     <div class="crash-title">CRASHED</div>
+    <div class="crash-reason" id="crash-reason">You landed on your roof</div>
     <div class="crash-stats">
       <div>Distance: <span id="crash-distance">0</span>m</div>
       <div>Score: <span id="crash-score">0</span></div>

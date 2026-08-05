@@ -5,6 +5,7 @@ import { createTerrainManager } from './terrain.js';
 import { createVehicle } from './vehicle.js';
 import { createCameraController } from './camera.js';
 import { createZoneManager } from './zones.js';
+import { createPickupManager } from './pickups.js';
 
 /* ============================== DOM ============================== */
 const canvas = document.getElementById('game-canvas');
@@ -17,18 +18,22 @@ const hud = document.getElementById('hud');
 const crashScreen = document.getElementById('crash-screen');
 const retryBtn = document.getElementById('retry-btn');
 const cameraToggleBtn = document.getElementById('camera-toggle');
+const pauseScreen = document.getElementById('pause-screen');
 
 const distanceEl = document.getElementById('hud-distance');
 const scoreEl = document.getElementById('hud-score');
+const bestEl = document.getElementById('hud-best');
 const speedFillEl = document.getElementById('speed-fill');
 const fuelFillEl = document.getElementById('fuel-fill');
 const zoneTagEl = document.getElementById('zone-tag');
 const airBadgeEl = document.getElementById('air-badge');
 const flipBadgeEl = document.getElementById('flip-badge');
+const fuelBadgeEl = document.getElementById('fuel-badge');
 const crashDistanceEl = document.getElementById('crash-distance');
 const crashScoreEl = document.getElementById('crash-score');
+const crashReasonEl = document.getElementById('crash-reason');
 
-/* ============================== THREE SETUP (cheap, runs immediately) ====== */
+/* ============================== THREE SETUP ============================== */
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
@@ -45,19 +50,17 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// the car spawns here — chosen well inside the first streamed chunk (not right
-// at z=0) so there's a full chunk's width of road behind it too, in case the
-// player brakes/reverses right at the start.
 const SPAWN_Z = 20;
 
-// FIX: raised from 1.2 — the vehicle's resting ground clearance (wheel
-// connection y-offset + suspension rest length + wheel radius) is ~1.05m, so
-// 1.2 left almost no margin and could start the car partially embedded on
-// sloped/banked road. This also gives cannon-es's solver a couple of extra
-// frames of fall time to settle suspension before first contact.
-const SPAWN_HEIGHT_OFFSET = 4;
+// FIX: was 4 m, which dropped the car onto the road hard enough to bounce and
+// occasionally land badly before the player had touched anything. Now that
+// wheel raycasts actually detect the road (see roadgen's handedness fix) the
+// suspension settles on its own, so a small clearance is all that is needed.
+const SPAWN_HEIGHT_OFFSET = 1.5;
 
-/* ============================== LOADING PROGRESS HELPERS ============================== */
+const BEST_KEY = 'ridgerunner.best';
+
+/* ============================== LOADING HELPERS ============================== */
 function updateProgress(pct, tip) {
   loadingFill.style.width = Math.min(100, pct) + '%';
   if (tip) loadingTip.textContent = tip;
@@ -66,73 +69,73 @@ function yieldFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }
 
-/* ============================== GAME STATE (populated during boot) ========= */
-let world, terrain, vehicle, cameraController, zoneManager;
+function loadBest() {
+  try { return Number(localStorage.getItem(BEST_KEY)) || 0; } catch { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem(BEST_KEY, String(v)); } catch { /* private mode, ignore */ }
+}
+
+/* ============================== GAME STATE ============================== */
+let world, terrain, vehicle, cameraController, zoneManager, pickups;
 const keys = {};
 let fuel = 100;
 let score = 0;
+let best = loadBest();
 let distance = SPAWN_Z;
 let started = false;
 let gameOver = false;
-let wasAirborne = false;
+let paused = false;
 
-// FIX: tracks the y-height of the road surface as of the last frame the
-// vehicle was actually grounded. Used by the tunneling-glitch safety check
-// below — a real jump follows the terrain's rough shape, but a fall-through
-// bug sends position.y plunging far below wherever the ground last was.
+// height of the road the last time the car was genuinely grounded, used by the
+// tunnelling safety net below
 let lastKnownGroundY = 0;
-
-// FIX: terrain.update() needs the car's current speed to widen its lookahead
-// (see terrain.js), but that update() call happens before vehicle.update()
-// runs for this frame — so it uses last frame's speed. One frame of lag on a
-// buffer distance is irrelevant; this just needs to be roughly right.
 let lastSpeed = 0;
 
-/* ============================== BOOT SEQUENCE ============================== */
+/* Fuel burn. The original drained ~2%/s with no way to refuel, emptying a full
+ * tank in about 45 s and ending every run the same way. Burn is gentler now and
+ * pickups.js scatters cans along the road, so fuel is a reason to keep moving
+ * rather than a countdown you cannot affect. */
+const FUEL_IDLE_BURN = 0.9;      // per second
+const FUEL_THROTTLE_BURN = 0.7;  // extra per second at full throttle
+
+/* ============================== BOOT ============================== */
 async function boot() {
-  updateProgress(2, 'Warming up the engine…');
+  updateProgress(2, 'Warming up the engine...');
   await yieldFrame();
 
-  /* ---- physics world (fast) ---- */
   world = new CANNON.World({ gravity: new CANNON.Vec3(0, -18, 0) });
   world.broadphase = new CANNON.SAPBroadphase(world);
   world.solver.iterations = 12;
   world.defaultContactMaterial.friction = 0.4;
-  updateProgress(5, 'Setting up physics…');
+  updateProgress(5, 'Setting up physics...');
   await yieldFrame();
 
-  /* ---- terrain: preload a window of chunks around the spawn point ---- */
   terrain = createTerrainManager(scene, world);
   await terrain.ensureRange(SPAWN_Z, async (frac) => {
-    updateProgress(5 + frac * 55, 'Carving the mountain road…');
+    updateProgress(5 + frac * 55, 'Carving the mountain road...');
     await yieldFrame();
   });
   updateProgress(60, 'Road complete');
   await yieldFrame();
 
-  /* ---- atmosphere / lighting (weight 60 -> 78) ---- */
-  updateProgress(64, 'Setting the sky…');
+  updateProgress(64, 'Setting the sky...');
   await yieldFrame();
   zoneManager = createZoneManager(scene);
   updateProgress(78, 'Sky ready');
   await yieldFrame();
 
-  /* ---- vehicle (weight 78 -> 92) ----
-     Spawn position comes from the exact same sampleRoad() the terrain chunks
-     used to build their geometry, so the ground is guaranteed to be there —
-     no more falling through gaps between "where we think the road is" and
-     "where the road mesh actually got built". */
-  updateProgress(80, 'Assembling the buggy…');
+  updateProgress(80, 'Assembling the buggy...');
   await yieldFrame();
   const spawnSample = sampleRoad(SPAWN_Z);
   const spawnPos = new THREE.Vector3(spawnSample.x, spawnSample.y + SPAWN_HEIGHT_OFFSET, spawnSample.z);
   vehicle = createVehicle(world, spawnPos);
   scene.add(vehicle.sceneGroup);
   lastKnownGroundY = spawnSample.y;
-  updateProgress(92, 'Buggy ready');
+  updateProgress(90, 'Buggy ready');
   await yieldFrame();
 
-  /* ---- final wiring (weight 92 -> 100) ---- */
+  pickups = createPickupManager(scene);
   cameraController = createCameraController(camera);
   bindInput();
   updateProgress(100, 'Ready to ride!');
@@ -144,13 +147,24 @@ async function boot() {
 }
 
 /* ============================== INPUT ============================== */
+// keys the browser would otherwise act on (scrolling the page) while driving
+const SWALLOW = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space']);
+
 function bindInput() {
   window.addEventListener('keydown', (e) => {
+    if (SWALLOW.has(e.code)) e.preventDefault();
+    if (e.repeat) return;
     keys[e.code] = true;
     if (e.code === 'KeyC') toggleCamera();
     if (e.code === 'KeyR') resetVehicle();
+    if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
   });
-  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('keyup', (e) => {
+    if (SWALLOW.has(e.code)) e.preventDefault();
+    keys[e.code] = false;
+  });
+  // dropping focus (alt-tab) used to leave keys stuck down
+  window.addEventListener('blur', () => { for (const k of Object.keys(keys)) keys[k] = false; });
 
   cameraToggleBtn.addEventListener('click', toggleCamera);
 
@@ -172,118 +186,137 @@ function bindInput() {
 
 function toggleCamera() {
   cameraController.toggle();
-  cameraToggleBtn.textContent = cameraController.mode === 'chase' ? '📷' : '🚗';
+  cameraToggleBtn.textContent = cameraController.mode === 'chase' ? '\u{1F4F7}' : '\u{1F697}';
+}
+
+function togglePause() {
+  if (!started || gameOver) return;
+  paused = !paused;
+  pauseScreen.classList.toggle('hidden', !paused);
 }
 
 function readControls() {
   const throttle = (keys['KeyW'] || keys['ArrowUp']) ? 1 : 0;
   const brake = (keys['KeyS'] || keys['ArrowDown']) ? 1 : 0;
-  let tilt = 0;
-  if (keys['KeyA'] || keys['ArrowLeft']) tilt -= 1;
-  if (keys['KeyD'] || keys['ArrowRight']) tilt += 1;
+  let lateral = 0;
+  if (keys['KeyA'] || keys['ArrowLeft']) lateral -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) lateral += 1;
   const handbrake = !!keys['Space'];
-  return { throttle, brake, tilt, handbrake };
+  // A/D now do double duty: they steer the front wheels on the ground and
+  // pitch the chassis in the air. vehicle.js decides which applies.
+  return { throttle, brake, steer: lateral, tilt: lateral, handbrake };
 }
 
-/* touch controls (mobile) */
+/* touch / pointer controls */
 function bindHoldButton(id, key) {
   const el = document.getElementById(id);
   if (!el) return;
   const set = (v) => (keys[key] = v);
-  el.addEventListener('touchstart', (e) => { e.preventDefault(); set(true); }, { passive: false });
-  el.addEventListener('touchend', (e) => { e.preventDefault(); set(false); }, { passive: false });
+  // FIX: only touchstart/touchend were bound, so the on-screen buttons did
+  // nothing for mouse or stylus users. Pointer events cover all three.
+  el.addEventListener('pointerdown', (e) => { e.preventDefault(); set(true); el.setPointerCapture?.(e.pointerId); });
+  el.addEventListener('pointerup', (e) => { e.preventDefault(); set(false); });
+  el.addEventListener('pointercancel', () => set(false));
+  el.addEventListener('pointerleave', () => set(false));
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 /* ============================== RESET HELPERS ============================== */
-function resetVehicle() {
-  const z = Math.max(SPAWN_Z, distance - 15);
+function respawnAt(z) {
   const s = sampleRoad(z);
   vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, z));
-  terrain.update(z, 0); // make sure the ground we're resetting onto is actually loaded
+  terrain.update(z, 0);
   lastKnownGroundY = s.y;
   lastSpeed = 0;
+}
+
+function resetVehicle() {
+  if (!started) return;
+  respawnAt(Math.max(SPAWN_Z, distance - 15));
   fuel = Math.max(fuel, 30);
   gameOver = false;
   crashScreen.classList.add('hidden');
-  // FIX: this hid the crash screen but never brought the HUD back — only the
-  // "TRY AGAIN" button's own click handler did that. Pressing R right after
-  // a crash used to resume gameplay with no distance/score/speed/fuel UI.
+  // FIX: this hid the crash screen but never restored the HUD, so pressing R
+  // after a crash resumed play with no distance/score/speed/fuel readout.
   hud.classList.remove('hidden');
 }
 
 function fullReset() {
-  const s = sampleRoad(SPAWN_Z);
-  vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, SPAWN_Z));
-  terrain.update(SPAWN_Z, 0);
-  lastKnownGroundY = s.y;
-  lastSpeed = 0;
+  respawnAt(SPAWN_Z);
+  pickups.reset();
   fuel = 100;
   score = 0;
   distance = SPAWN_Z;
   gameOver = false;
+  paused = false;
+  pauseScreen.classList.add('hidden');
   crashScreen.classList.add('hidden');
+}
+
+function endRun(reason) {
+  gameOver = true;
+  if (score > best) { best = score; saveBest(best); }
+  crashDistanceEl.textContent = Math.floor(distance - SPAWN_Z);
+  crashScoreEl.textContent = score;
+  if (crashReasonEl) crashReasonEl.textContent = reason;
+  crashScreen.classList.remove('hidden');
+  hud.classList.add('hidden');
 }
 
 /* ============================== MAIN LOOP ============================== */
 const clock = new THREE.Clock();
-const FIXED_DT = 1 / 60;
+// FIX: halved from 1/60. Wheel contact is a raycast reaching ~1 m below each
+// wheel, so the shorter the step the less distance the car covers between
+// contact tests and the harder it is to slip through the road on a fast
+// landing. MAX_STEPS stops a stalled tab from trying to catch up all at once.
+const FIXED_DT = 1 / 120;
+const MAX_STEPS = 8;
 let accumulator = 0;
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
 
-  if (started && !gameOver) {
-    // stream terrain/road chunks in around the car before stepping physics,
-    // so the ground the wheels are about to raycast against already exists.
-    // Passing speed widens the lookahead at high speed — see terrain.js.
-    terrain.update(distance, lastSpeed);
+  if (started && !gameOver && !paused) {
+    // stream chunks in around the car's ACTUAL position before stepping
+    // physics. FIX: this used to be passed `distance`, which only ever
+    // increases, so reversing or being knocked backwards could put the car on
+    // road that had already been unloaded.
+    const carZ = vehicle.chassisBody.position.z;
+    terrain.update(carZ, lastSpeed);
 
     accumulator += dt;
-    while (accumulator >= FIXED_DT) {
+    let steps = 0;
+    while (accumulator >= FIXED_DT && steps < MAX_STEPS) {
       world.step(FIXED_DT);
       accumulator -= FIXED_DT;
+      steps++;
     }
+    if (steps === MAX_STEPS) accumulator = 0;
 
     const controls = readControls();
 
-    // FIX: fuel-out "sputtering" used to reduce controls.throttle AFTER
-    // vehicle.update(controls, dt) had already consumed it for this frame,
-    // so running out of fuel never actually affected driving. Fuel is now
-    // calculated and the throttle penalty applied before physics uses it.
-    fuel = Math.max(0, fuel - dt * 1.15 - controls.throttle * dt * 0.9);
+    // fuel is spent before physics consumes the throttle, so running dry
+    // actually affects this frame's driving
+    fuel = Math.max(0, fuel - dt * FUEL_IDLE_BURN - controls.throttle * dt * FUEL_THROTTLE_BURN);
     if (fuel <= 0) controls.throttle *= 0.15;
 
     const state = vehicle.update(controls, dt);
     lastSpeed = state.speed;
 
-    // TEMP DEBUG — remove once the fall-through issue is confirmed fixed.
-    // Logs roughly twice a second so the console doesn't get flooded.
-    if (Math.floor(performance.now() / 500) !== window.__lastDbgTick) {
-      window.__lastDbgTick = Math.floor(performance.now() / 500);
-      const wheelDebug = vehicle.vehicle.wheelInfos.map(w => ({
-        hasHit: w.raycastResult && w.raycastResult.hasHit,
-        dist: w.raycastResult ? Number(w.raycastResult.distance).toFixed(2) : 'n/a',
-        suspensionLength: w.suspensionLength !== undefined ? Number(w.suspensionLength).toFixed(2) : 'n/a',
-      }));
-      console.log(
-        '[vehicle]', 'grounded:', state.grounded,
-        '| pos:', state.position.x.toFixed(2), state.position.y.toFixed(2), state.position.z.toFixed(2),
-        '| world.bodies:', world.bodies.length
-      );
-      console.table(wheelDebug);
+    const reward = pickups.update(state.position, dt);
+    if (reward.collected > 0) {
+      fuel = Math.min(100, fuel + reward.fuel);
+      score += reward.score;
+      showBadge(fuelBadgeEl);
     }
 
     distance = Math.max(distance, state.position.z);
-
     score += Math.floor(state.speed * dt * 1.2);
+
     if (!state.grounded) {
-      wasAirborne = true;
       score += Math.floor(dt * 40); // air-time bonus
     } else {
-      wasAirborne = false;
-      // FIX: only trust position.y as "the ground" while actually grounded —
-      // this is what the tunneling safety-net check below compares against.
       lastKnownGroundY = state.position.y;
     }
     if (state.justFlipped) {
@@ -298,28 +331,15 @@ function animate() {
 
     cameraController.update(vehicle.mesh, state.speed, !state.grounded, dt);
 
-    // falling out of the world (e.g. off a canyon edge with no bridge underneath)
-    // is a valid crash, not a bug — catch it the same way as flipping
-    if (state.position.y < -80) {
-      state.crashed = true;
-    }
-
-    // FIX: safety net for physics tunneling glitches (e.g. a wheel raycast
-    // slipping through a chunk seam for a frame). A real jump stays airborne
-    // for a couple seconds at most and never drops far below the terrain it
-    // just left; a tunneling bug keeps free-falling well past that. Rather
-    // than let it turn into a "fell out of the world" crash 80m down, just
-    // snap the car back onto the road near where it lost contact.
+    // Safety net for physics tunnelling. A real jump never drops far below the
+    // terrain it left; a tunnelling bug free-falls well past it. Snap back onto
+    // the road rather than let it become a bogus "fell out of the world".
     if (!state.grounded && state.airTime > 3 && state.position.y < lastKnownGroundY - 10) {
-      vehicle.reset(new THREE.Vector3(state.position.x, sampleRoad(state.position.z).y + SPAWN_HEIGHT_OFFSET, state.position.z));
-    }
-
-    if (state.crashed) {
-      gameOver = true;
-      crashDistanceEl.textContent = Math.floor(distance);
-      crashScoreEl.textContent = score;
-      crashScreen.classList.remove('hidden');
-      hud.classList.add('hidden');
+      respawnAt(Math.max(SPAWN_Z, state.position.z));
+    } else if (state.position.y < lastKnownGroundY - 150) {
+      endRun('You went over the edge');
+    } else if (state.crashed) {
+      endRun('You landed on your roof');
     }
 
     updateHud(state);
@@ -331,6 +351,7 @@ function animate() {
 function updateHud(state) {
   distanceEl.innerHTML = Math.floor(distance - SPAWN_Z) + '<span class="hud-unit">m</span>';
   scoreEl.textContent = score;
+  if (bestEl) bestEl.textContent = Math.max(best, score);
   const speedKmh = state.speed * 3.6;
   speedFillEl.style.width = Math.min(100, (speedKmh / 140) * 100) + '%';
   fuelFillEl.style.width = fuel + '%';
@@ -338,15 +359,13 @@ function updateHud(state) {
 
   if (!state.grounded && state.airTime > 0.45) {
     airBadgeEl.classList.remove('hidden');
-    airBadgeEl.style.animation = 'none';
-    void airBadgeEl.offsetWidth;
-    airBadgeEl.style.animation = '';
   } else {
     airBadgeEl.classList.add('hidden');
   }
 }
 
 function showBadge(el) {
+  if (!el) return;
   el.classList.remove('hidden');
   el.style.animation = 'none';
   void el.offsetWidth;
