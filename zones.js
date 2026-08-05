@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { sampleRoad, ROAD_WIDTH } from './roadgen.js';
 
-const ZONES = [
+export const ZONES = [
   {
     name: 'SUNSET HILLS',
     start: 0,
@@ -42,16 +42,49 @@ const ZONES = [
     name: 'NIGHT',
     start: 4300,
     sky: [0x2a2450, 0x171236, 0x07061a],
-    fog: 0x140f30,
-    fogDensity: 0.0032,
-    ambient: 0x4a4a8a,
-    ambientIntensity: 0.28,
-    sun: 0x7d8cff,
-    sunIntensity: 0.35,
+    fog: 0x1b1640,
+    // FIX (night visibility): fog was 0.0032, nearly double the daytime value,
+    // while ambient sat at 0.28. Between them the road faded out a few metres
+    // ahead and the night zone was effectively unplayable. Fog is now thinner
+    // than daytime rather than thicker, and ambient is lifted to a moonlit
+    // level. Street lamps (scenery.js) and stronger headlights do the rest.
+    fogDensity: 0.0016,
+    ambient: 0x8290d8,
+    ambientIntensity: 0.62,
+    sun: 0x9aa8ff,
+    sunIntensity: 0.55,
     groundTint: 0x1c1c33,
   },
 ];
 const TRANSITION_BAND = 350;
+
+/**
+ * Ground colour at distance z, blended across zone boundaries. Pure function of
+ * z so terrain.js can tint verge vertices without needing the zone manager
+ * instance. groundTint was previously declared on every zone and never used.
+ */
+export function groundTintAt(z, target = new THREE.Color()) {
+  let idx = 0;
+  for (let i = 0; i < ZONES.length; i++) if (z >= ZONES[i].start) idx = i;
+  const zone = ZONES[idx];
+  const next = ZONES[idx + 1];
+  target.set(zone.groundTint);
+  if (next) {
+    const bandStart = next.start - TRANSITION_BAND;
+    if (z > bandStart) {
+      const t = Math.min(1, Math.max(0, (z - bandStart) / TRANSITION_BAND));
+      target.lerp(new THREE.Color(next.groundTint), t);
+    }
+  }
+  return target;
+}
+
+/** Which scenery belongs at distance z. */
+export function sceneryKindAt(z) {
+  let idx = 0;
+  for (let i = 0; i < ZONES.length; i++) if (z >= ZONES[i].start) idx = i;
+  return ZONES[idx].name;
+}
 // The road itself streams forever via terrain.js, but decorative props are
 // simple enough to just pre-scatter once, up front, out to a generous but
 // finite horizon — plenty of road for this game's scale (~9km).

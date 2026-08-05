@@ -18,12 +18,13 @@
 <body>
 
   <canvas id="game-canvas"></canvas>
+  <div id="damage-flash"></div>
 
   <!-- ===== LOADING SCREEN ===== -->
   <div id="loading-screen">
     <div class="loading-title">RIDGE<span>RUNNER</span></div>
     <div class="loading-bar"><div class="loading-bar-fill" id="loading-fill"></div></div>
-    <div class="loading-tip" id="loading-tip">TIP: TILT IN THE AIR TO STICK YOUR LANDING</div>
+    <div class="loading-tip" id="loading-tip">TIP: GRAB FUEL CANS TO KEEP YOUR RUN ALIVE</div>
   </div>
 
   <!-- ===== START OVERLAY ===== -->
@@ -32,9 +33,17 @@
     <div class="start-sub">a low&#8209;poly hill&#8209;climb</div>
     <button id="start-btn" class="chunky-btn">START ENGINE</button>
     <div class="controls-hint">
-      <div><b>W / &uarr;</b> gas &nbsp; <b>S / &darr;</b> brake</div>
-      <div><b>A / D</b> tilt in air &nbsp; <b>SPACE</b> handbrake</div>
-      <div><b>C</b> camera &nbsp; <b>R</b> reset</div>
+      <div><b>W / &uarr;</b> gas &nbsp; <b>S / &darr;</b> brake &amp; reverse</div>
+      <div><b>A / D</b> steer &mdash; and tilt while airborne</div>
+      <div><b>SPACE</b> handbrake &nbsp; <b>C</b> camera &nbsp; <b>M</b> mute</div>
+      <div><b>R</b> respawn (&minus;10 HP) &nbsp; <b>P / ESC</b> pause</div>
+    </div>
+    <div class="legend">
+      <span><i class="sw sw-fuel"></i>fuel</span>
+      <span><i class="sw sw-boost"></i>boost</span>
+      <span><i class="sw sw-shield"></i>shield</span>
+      <span><i class="sw sw-double"></i>2x score</span>
+      <span><i class="sw sw-hazard"></i>hazards hurt</span>
     </div>
   </div>
 
@@ -49,10 +58,16 @@
         <div class="hud-label">SCORE</div>
         <div class="hud-value" id="hud-score">0</div>
       </div>
+      <div class="hud-panel">
+        <div class="hud-label">BEST</div>
+        <div class="hud-value" id="hud-best">0</div>
+      </div>
+      <div class="power-row" id="power-row"></div>
     </div>
 
     <div class="hud-top-right">
       <button id="camera-toggle" class="icon-btn" title="Toggle camera (C)">&#128247;</button>
+      <button id="mute-toggle" class="icon-btn" title="Mute (M)">&#128266;</button>
       <div class="zone-tag" id="zone-tag">SUNSET HILLS</div>
     </div>
 
@@ -65,10 +80,15 @@
         <div class="gauge-label">FUEL</div>
         <div class="gauge-track"><div class="gauge-fill fuel-fill" id="fuel-fill"></div></div>
       </div>
+      <div class="gauge-wrap">
+        <div class="gauge-label">HULL</div>
+        <div class="gauge-track"><div class="gauge-fill health-fill" id="health-fill"></div></div>
+      </div>
     </div>
 
     <div class="air-badge hidden" id="air-badge">AIRBORNE!</div>
     <div class="flip-badge hidden" id="flip-badge">FLIP! +500</div>
+    <div class="toast hidden" id="toast"></div>
   </div>
 
   <!-- ===== TOUCH CONTROLS ===== -->
@@ -79,14 +99,25 @@
     <div class="touch-btn" id="btn-gas">&#9650;</div>
   </div>
 
+  <!-- ===== PAUSE OVERLAY ===== -->
+  <div id="pause-screen" class="hidden">
+    <div class="pause-title">PAUSED</div>
+    <button id="resume-btn" class="chunky-btn">RESUME</button>
+    <button id="quit-btn" class="chunky-btn ghost-btn">MAIN MENU</button>
+    <div class="pause-sub"><b>ESC</b> again returns to the menu</div>
+  </div>
+
   <!-- ===== CRASH / GAME OVER OVERLAY ===== -->
   <div id="crash-screen" class="hidden">
     <div class="crash-title">CRASHED</div>
+    <div class="crash-reason" id="crash-reason">You landed on your roof</div>
     <div class="crash-stats">
       <div>Distance: <span id="crash-distance">0</span>m</div>
       <div>Score: <span id="crash-score">0</span></div>
+      <div>Best: <span id="crash-best">0</span></div>
     </div>
     <button id="retry-btn" class="chunky-btn">TRY AGAIN</button>
+    <button id="menu-btn" class="chunky-btn ghost-btn">MAIN MENU</button>
   </div>
 
   <script type="module" src="main.js"></script>

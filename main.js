@@ -1,34 +1,52 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
-import { sampleRoad } from './roadgen.js';
-import { createTerrainManager } from './terrain.js';
-import { createVehicle } from './vehicle.js';
+import { sampleRoad, sampleRoadFrame, ROAD_WIDTH } from './roadgen.js';
+import { createTerrainManager, ROAD_MATERIAL, BARRIER_MATERIAL } from './terrain.js';
+import { createVehicle, CHASSIS_MATERIAL } from './vehicle.js';
 import { createCameraController } from './camera.js';
 import { createZoneManager } from './zones.js';
+import { setLampsLit } from './scenery.js';
+import { createPickupManager, PICKUP, FUEL_PER_CAN, BOOST_SECONDS, SHIELD_SECONDS, DOUBLE_SECONDS } from './pickups.js';
+import { createHazardManager, HAZARD, ROCK_DAMAGE, BARREL_DAMAGE, OIL_GRIP_PENALTY, OIL_SECONDS } from './hazards.js';
+import { createEffects } from './effects.js';
+import { createAudio } from './audio.js';
 
 /* ============================== DOM ============================== */
-const canvas = document.getElementById('game-canvas');
-const loadingScreen = document.getElementById('loading-screen');
-const loadingFill = document.getElementById('loading-fill');
-const loadingTip = document.getElementById('loading-tip');
-const startScreen = document.getElementById('start-screen');
-const startBtn = document.getElementById('start-btn');
-const hud = document.getElementById('hud');
-const crashScreen = document.getElementById('crash-screen');
-const retryBtn = document.getElementById('retry-btn');
-const cameraToggleBtn = document.getElementById('camera-toggle');
+const $ = (id) => document.getElementById(id);
+const canvas = $('game-canvas');
+const loadingScreen = $('loading-screen');
+const loadingFill = $('loading-fill');
+const loadingTip = $('loading-tip');
+const startScreen = $('start-screen');
+const startBtn = $('start-btn');
+const hud = $('hud');
+const crashScreen = $('crash-screen');
+const retryBtn = $('retry-btn');
+const menuBtn = $('menu-btn');
+const resumeBtn = $('resume-btn');
+const quitBtn = $('quit-btn');
+const cameraToggleBtn = $('camera-toggle');
+const muteBtn = $('mute-toggle');
+const pauseScreen = $('pause-screen');
 
-const distanceEl = document.getElementById('hud-distance');
-const scoreEl = document.getElementById('hud-score');
-const speedFillEl = document.getElementById('speed-fill');
-const fuelFillEl = document.getElementById('fuel-fill');
-const zoneTagEl = document.getElementById('zone-tag');
-const airBadgeEl = document.getElementById('air-badge');
-const flipBadgeEl = document.getElementById('flip-badge');
-const crashDistanceEl = document.getElementById('crash-distance');
-const crashScoreEl = document.getElementById('crash-score');
+const distanceEl = $('hud-distance');
+const scoreEl = $('hud-score');
+const bestEl = $('hud-best');
+const speedFillEl = $('speed-fill');
+const fuelFillEl = $('fuel-fill');
+const healthFillEl = $('health-fill');
+const zoneTagEl = $('zone-tag');
+const airBadgeEl = $('air-badge');
+const flipBadgeEl = $('flip-badge');
+const toastEl = $('toast');
+const powerRowEl = $('power-row');
+const crashDistanceEl = $('crash-distance');
+const crashScoreEl = $('crash-score');
+const crashBestEl = $('crash-best');
+const crashReasonEl = $('crash-reason');
+const flashEl = $('damage-flash');
 
-/* ============================== THREE SETUP (cheap, runs immediately) ====== */
+/* ============================== THREE SETUP ============================== */
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
@@ -45,308 +63,457 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// the car spawns here — chosen well inside the first streamed chunk (not right
-// at z=0) so there's a full chunk's width of road behind it too, in case the
-// player brakes/reverses right at the start.
 const SPAWN_Z = 20;
+const SPAWN_HEIGHT_OFFSET = 1.5;
+const BEST_KEY = 'ridgerunner.best';
+const MAX_HEALTH = 100;
 
-// FIX: raised from 1.2 — the vehicle's resting ground clearance (wheel
-// connection y-offset + suspension rest length + wheel radius) is ~1.05m, so
-// 1.2 left almost no margin and could start the car partially embedded on
-// sloped/banked road. This also gives cannon-es's solver a couple of extra
-// frames of fall time to settle suspension before first contact.
-const SPAWN_HEIGHT_OFFSET = 4;
+/* ============================== STATE MACHINE ==============================
+ * Previously `started`, `gameOver` and `paused` were three loose booleans and
+ * Escape only toggled pause, with no way back to the menu. A single explicit
+ * state makes the legal transitions obvious and is what the Escape key needs. */
+const STATE = { LOADING: 'LOADING', MENU: 'MENU', PLAYING: 'PLAYING', PAUSED: 'PAUSED', OVER: 'OVER' };
+let state = STATE.LOADING;
 
-/* ============================== LOADING PROGRESS HELPERS ============================== */
+function setState(next) {
+  state = next;
+  startScreen.classList.toggle('hidden', next !== STATE.MENU);
+  hud.classList.toggle('hidden', next !== STATE.PLAYING && next !== STATE.PAUSED);
+  pauseScreen.classList.toggle('hidden', next !== STATE.PAUSED);
+  crashScreen.classList.toggle('hidden', next !== STATE.OVER);
+}
+
+/* ============================== HELPERS ============================== */
 function updateProgress(pct, tip) {
   loadingFill.style.width = Math.min(100, pct) + '%';
   if (tip) loadingTip.textContent = tip;
 }
 function yieldFrame() {
-  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
+function loadBest() { try { return Number(localStorage.getItem(BEST_KEY)) || 0; } catch { return 0; } }
+function saveBest(v) { try { localStorage.setItem(BEST_KEY, String(v)); } catch { /* private mode */ } }
 
-/* ============================== GAME STATE (populated during boot) ========= */
-let world, terrain, vehicle, cameraController, zoneManager;
+/* ============================== GAME STATE ============================== */
+let world, terrain, vehicle, cameraController, zoneManager, pickups, hazards, effects, audio;
 const keys = {};
 let fuel = 100;
+let health = MAX_HEALTH;
 let score = 0;
+let best = loadBest();
 let distance = SPAWN_Z;
-let started = false;
-let gameOver = false;
-let wasAirborne = false;
-
-// FIX: tracks the y-height of the road surface as of the last frame the
-// vehicle was actually grounded. Used by the tunneling-glitch safety check
-// below — a real jump follows the terrain's rough shape, but a fall-through
-// bug sends position.y plunging far below wherever the ground last was.
 let lastKnownGroundY = 0;
-
-// FIX: terrain.update() needs the car's current speed to widen its lookahead
-// (see terrain.js), but that update() call happens before vehicle.update()
-// runs for this frame — so it uses last frame's speed. One frame of lag on a
-// buffer distance is irrelevant; this just needs to be roughly right.
 let lastSpeed = 0;
 
-/* ============================== BOOT SEQUENCE ============================== */
+// power-up timers, in seconds remaining
+const timers = { boost: 0, shield: 0, double: 0, oil: 0 };
+
+const FUEL_IDLE_BURN = 1.2;
+const FUEL_THROTTLE_BURN = 0.9;
+
+/* ============================== BOOT ============================== */
 async function boot() {
-  updateProgress(2, 'Warming up the engine…');
+  updateProgress(2, 'Warming up the engine...');
   await yieldFrame();
 
-  /* ---- physics world (fast) ---- */
   world = new CANNON.World({ gravity: new CANNON.Vec3(0, -18, 0) });
   world.broadphase = new CANNON.SAPBroadphase(world);
   world.solver.iterations = 12;
   world.defaultContactMaterial.friction = 0.4;
-  updateProgress(5, 'Setting up physics…');
+
+  /* Guardrails are almost frictionless against the chassis, with a little
+   * bounce. Previously they used the world default of 0.4, which meant clipping
+   * a rail at speed killed nearly all forward momentum and parked the car
+   * against the wall. Now it slides along and scrapes. */
+  /* Barrier friction is deliberately ZERO. Solver friction against a wall the
+   * car is being driven into is violently nonlinear, because the normal force
+   * needed to resolve the penetration is huge and the friction force scales
+   * with it. Measured, clipping a rail at 122 km/h and straightening up:
+   *     mu = 0.40  ->   0% of speed kept (dead stop, the reported bug)
+   *     mu = 0.20  ->   0%
+   *     mu = 0.02  ->  12%
+   *     mu = 0.00  ->  95%
+   * There is no usable value between "sticks like glue" and "frictionless", so
+   * the wall is frictionless and the cost of scraping is applied as a scripted
+   * scrub in step() instead, where it can actually be tuned. */
+  world.addContactMaterial(new CANNON.ContactMaterial(CHASSIS_MATERIAL, BARRIER_MATERIAL, {
+    friction: 0, restitution: 0.25,
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(CHASSIS_MATERIAL, ROAD_MATERIAL, {
+    friction: 0.35, restitution: 0,
+  }));
+  updateProgress(6, 'Setting up physics...');
   await yieldFrame();
 
-  /* ---- terrain: preload a window of chunks around the spawn point ---- */
   terrain = createTerrainManager(scene, world);
   await terrain.ensureRange(SPAWN_Z, async (frac) => {
-    updateProgress(5 + frac * 55, 'Carving the mountain road…');
+    updateProgress(6 + frac * 52, 'Carving the mountain road...');
     await yieldFrame();
   });
-  updateProgress(60, 'Road complete');
+  updateProgress(58, 'Road complete');
   await yieldFrame();
 
-  /* ---- atmosphere / lighting (weight 60 -> 78) ---- */
-  updateProgress(64, 'Setting the sky…');
+  updateProgress(62, 'Setting the sky...');
   await yieldFrame();
   zoneManager = createZoneManager(scene);
-  updateProgress(78, 'Sky ready');
+  updateProgress(74, 'Sky ready');
   await yieldFrame();
 
-  /* ---- vehicle (weight 78 -> 92) ----
-     Spawn position comes from the exact same sampleRoad() the terrain chunks
-     used to build their geometry, so the ground is guaranteed to be there —
-     no more falling through gaps between "where we think the road is" and
-     "where the road mesh actually got built". */
-  updateProgress(80, 'Assembling the buggy…');
+  updateProgress(78, 'Assembling the buggy...');
   await yieldFrame();
-  const spawnSample = sampleRoad(SPAWN_Z);
-  const spawnPos = new THREE.Vector3(spawnSample.x, spawnSample.y + SPAWN_HEIGHT_OFFSET, spawnSample.z);
-  vehicle = createVehicle(world, spawnPos);
+  const s = sampleRoad(SPAWN_Z);
+  vehicle = createVehicle(world, new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, SPAWN_Z));
   scene.add(vehicle.sceneGroup);
-  lastKnownGroundY = spawnSample.y;
-  updateProgress(92, 'Buggy ready');
+  lastKnownGroundY = s.y;
+  updateProgress(88, 'Buggy ready');
   await yieldFrame();
 
-  /* ---- final wiring (weight 92 -> 100) ---- */
+  pickups = createPickupManager(scene);
+  hazards = createHazardManager(scene);
+  effects = createEffects(scene);
+  audio = createAudio();
   cameraController = createCameraController(camera);
   bindInput();
   updateProgress(100, 'Ready to ride!');
   await yieldFrame();
 
   loadingScreen.classList.add('hidden');
-  startScreen.classList.remove('hidden');
+  setState(STATE.MENU);
   requestAnimationFrame(animate);
 }
 
 /* ============================== INPUT ============================== */
+const SWALLOW = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space']);
+
 function bindInput() {
   window.addEventListener('keydown', (e) => {
+    if (SWALLOW.has(e.code)) e.preventDefault();
+    if (e.repeat) return;
     keys[e.code] = true;
     if (e.code === 'KeyC') toggleCamera();
-    if (e.code === 'KeyR') resetVehicle();
+    if (e.code === 'KeyR' && state === STATE.PLAYING) respawnPenalty();
+    if (e.code === 'KeyM') toggleMute();
+    if (e.code === 'KeyP') togglePause();
+    if (e.code === 'Escape') onEscape();
   });
-  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('keyup', (e) => {
+    if (SWALLOW.has(e.code)) e.preventDefault();
+    keys[e.code] = false;
+  });
+  window.addEventListener('blur', () => { for (const k of Object.keys(keys)) keys[k] = false; });
 
   cameraToggleBtn.addEventListener('click', toggleCamera);
+  if (muteBtn) muteBtn.addEventListener('click', toggleMute);
 
   bindHoldButton('btn-gas', 'KeyW');
   bindHoldButton('btn-brake', 'KeyS');
   bindHoldButton('btn-left', 'KeyA');
   bindHoldButton('btn-right', 'KeyD');
 
-  startBtn.addEventListener('click', () => {
-    startScreen.classList.add('hidden');
-    hud.classList.remove('hidden');
-    started = true;
-  });
-  retryBtn.addEventListener('click', () => {
-    fullReset();
-    hud.classList.remove('hidden');
-  });
+  startBtn.addEventListener('click', () => { audio.start(); audio.uiClick(); beginRun(); });
+  retryBtn.addEventListener('click', () => { audio.uiClick(); beginRun(); });
+  if (menuBtn) menuBtn.addEventListener('click', () => { audio.uiClick(); toMenu(); });
+  if (resumeBtn) resumeBtn.addEventListener('click', () => { audio.uiClick(); togglePause(); });
+  if (quitBtn) quitBtn.addEventListener('click', () => { audio.uiClick(); toMenu(); });
+}
+
+/* Escape is context-sensitive: it pauses a run, and from the pause screen it
+ * goes back to the main menu. Previously it did nothing at all. */
+function onEscape() {
+  if (state === STATE.PLAYING) togglePause();
+  else if (state === STATE.PAUSED) toMenu();
+  else if (state === STATE.OVER) toMenu();
 }
 
 function toggleCamera() {
   cameraController.toggle();
-  cameraToggleBtn.textContent = cameraController.mode === 'chase' ? '📷' : '🚗';
+  cameraToggleBtn.textContent = cameraController.mode === 'chase' ? '\u{1F4F7}' : '\u{1F697}';
+}
+
+function toggleMute() {
+  if (!audio) return;
+  audio.setMuted(!audio.isMuted());
+  if (muteBtn) muteBtn.textContent = audio.isMuted() ? '\u{1F507}' : '\u{1F50A}';
+}
+
+function togglePause() {
+  if (state === STATE.PLAYING) setState(STATE.PAUSED);
+  else if (state === STATE.PAUSED) { setState(STATE.PLAYING); audio.resume(); }
 }
 
 function readControls() {
   const throttle = (keys['KeyW'] || keys['ArrowUp']) ? 1 : 0;
   const brake = (keys['KeyS'] || keys['ArrowDown']) ? 1 : 0;
-  let tilt = 0;
-  if (keys['KeyA'] || keys['ArrowLeft']) tilt -= 1;
-  if (keys['KeyD'] || keys['ArrowRight']) tilt += 1;
-  const handbrake = !!keys['Space'];
-  return { throttle, brake, tilt, handbrake };
+  let lateral = 0;
+  if (keys['KeyA'] || keys['ArrowLeft']) lateral -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) lateral += 1;
+  return {
+    throttle, brake,
+    steer: lateral, tilt: lateral,
+    handbrake: !!keys['Space'],
+    boost: timers.boost > 0,
+    gripScale: timers.oil > 0 ? OIL_GRIP_PENALTY : 1,
+  };
 }
 
-/* touch controls (mobile) */
 function bindHoldButton(id, key) {
-  const el = document.getElementById(id);
+  const el = $(id);
   if (!el) return;
   const set = (v) => (keys[key] = v);
-  el.addEventListener('touchstart', (e) => { e.preventDefault(); set(true); }, { passive: false });
-  el.addEventListener('touchend', (e) => { e.preventDefault(); set(false); }, { passive: false });
+  el.addEventListener('pointerdown', (e) => { e.preventDefault(); set(true); el.setPointerCapture?.(e.pointerId); });
+  el.addEventListener('pointerup', (e) => { e.preventDefault(); set(false); });
+  el.addEventListener('pointercancel', () => set(false));
+  el.addEventListener('pointerleave', () => set(false));
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
-/* ============================== RESET HELPERS ============================== */
-function resetVehicle() {
-  const z = Math.max(SPAWN_Z, distance - 15);
+/* ============================== RUN LIFECYCLE ============================== */
+function respawnAt(z) {
   const s = sampleRoad(z);
   vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, z));
-  terrain.update(z, 0); // make sure the ground we're resetting onto is actually loaded
+  terrain.update(z, 0);
   lastKnownGroundY = s.y;
   lastSpeed = 0;
-  fuel = Math.max(fuel, 30);
-  gameOver = false;
-  crashScreen.classList.add('hidden');
-  // FIX: this hid the crash screen but never brought the HUD back — only the
-  // "TRY AGAIN" button's own click handler did that. Pressing R right after
-  // a crash used to resume gameplay with no distance/score/speed/fuel UI.
-  hud.classList.remove('hidden');
 }
 
-function fullReset() {
-  const s = sampleRoad(SPAWN_Z);
-  vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, SPAWN_Z));
-  terrain.update(SPAWN_Z, 0);
-  lastKnownGroundY = s.y;
-  lastSpeed = 0;
+/** Manual respawn (R). Costs health, so it can't be used to cheese hazards. */
+function respawnPenalty() {
+  respawnAt(Math.max(SPAWN_Z, distance - 15));
+  health = Math.max(1, health - 10);
+  timers.oil = 0;
+  toast('RESPAWN  -10 HP');
+}
+
+function beginRun() {
+  respawnAt(SPAWN_Z);
+  pickups.reset();
+  hazards.reset();
+  effects.reset();
   fuel = 100;
+  health = MAX_HEALTH;
   score = 0;
   distance = SPAWN_Z;
-  gameOver = false;
-  crashScreen.classList.add('hidden');
+  timers.boost = timers.shield = timers.double = timers.oil = 0;
+  setState(STATE.PLAYING);
+  audio.start();
+  audio.resume();
+}
+
+function toMenu() {
+  setState(STATE.MENU);
+  respawnAt(SPAWN_Z);
+  distance = SPAWN_Z;
+}
+
+function endRun(reason) {
+  if (score > best) { best = score; saveBest(best); }
+  crashDistanceEl.textContent = Math.floor(distance - SPAWN_Z);
+  crashScoreEl.textContent = score;
+  if (crashBestEl) crashBestEl.textContent = best;
+  if (crashReasonEl) crashReasonEl.textContent = reason;
+  audio.crash();
+  cameraController.addTrauma(1);
+  setState(STATE.OVER);
+}
+
+function toast(text) {
+  if (!toastEl) return;
+  toastEl.textContent = text;
+  toastEl.classList.remove('hidden');
+  toastEl.style.animation = 'none';
+  void toastEl.offsetWidth;
+  toastEl.style.animation = '';
+  clearTimeout(toastEl._t);
+  toastEl._t = setTimeout(() => toastEl.classList.add('hidden'), 1100);
+}
+
+function damageFlash() {
+  if (!flashEl) return;
+  flashEl.style.animation = 'none';
+  void flashEl.offsetWidth;
+  flashEl.style.animation = 'dmg-flash 0.45s ease-out';
 }
 
 /* ============================== MAIN LOOP ============================== */
 const clock = new THREE.Clock();
-const FIXED_DT = 1 / 60;
+const FIXED_DT = 1 / 120;
+const MAX_STEPS = 8;
 let accumulator = 0;
+const _fwd = new THREE.Vector3();
+const _rel = new THREE.Vector3();
+const _scrapePoint = new THREE.Vector3();
 
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
 
-  if (started && !gameOver) {
-    // stream terrain/road chunks in around the car before stepping physics,
-    // so the ground the wheels are about to raycast against already exists.
-    // Passing speed widens the lookahead at high speed — see terrain.js.
-    terrain.update(distance, lastSpeed);
-
-    accumulator += dt;
-    while (accumulator >= FIXED_DT) {
-      world.step(FIXED_DT);
-      accumulator -= FIXED_DT;
-    }
-
-    const controls = readControls();
-
-    // FIX: fuel-out "sputtering" used to reduce controls.throttle AFTER
-    // vehicle.update(controls, dt) had already consumed it for this frame,
-    // so running out of fuel never actually affected driving. Fuel is now
-    // calculated and the throttle penalty applied before physics uses it.
-    fuel = Math.max(0, fuel - dt * 1.15 - controls.throttle * dt * 0.9);
-    if (fuel <= 0) controls.throttle *= 0.15;
-
-    const state = vehicle.update(controls, dt);
-    lastSpeed = state.speed;
-
-    // TEMP DEBUG — remove once the fall-through issue is confirmed fixed.
-    // Logs roughly twice a second so the console doesn't get flooded.
-    if (Math.floor(performance.now() / 500) !== window.__lastDbgTick) {
-      window.__lastDbgTick = Math.floor(performance.now() / 500);
-      const wheelDebug = vehicle.vehicle.wheelInfos.map(w => ({
-        hasHit: w.raycastResult && w.raycastResult.hasHit,
-        dist: w.raycastResult ? Number(w.raycastResult.distance).toFixed(2) : 'n/a',
-        suspensionLength: w.suspensionLength !== undefined ? Number(w.suspensionLength).toFixed(2) : 'n/a',
-      }));
-      console.log(
-        '[vehicle]', 'grounded:', state.grounded,
-        '| pos:', state.position.x.toFixed(2), state.position.y.toFixed(2), state.position.z.toFixed(2),
-        '| world.bodies:', world.bodies.length
-      );
-      console.table(wheelDebug);
-    }
-
-    distance = Math.max(distance, state.position.z);
-
-    score += Math.floor(state.speed * dt * 1.2);
-    if (!state.grounded) {
-      wasAirborne = true;
-      score += Math.floor(dt * 40); // air-time bonus
-    } else {
-      wasAirborne = false;
-      // FIX: only trust position.y as "the ground" while actually grounded —
-      // this is what the tunneling safety-net check below compares against.
-      lastKnownGroundY = state.position.y;
-    }
-    if (state.justFlipped) {
-      score += 500;
-      showBadge(flipBadgeEl);
-    }
-
-    const zoneInfo = zoneManager.update(distance);
-    zoneManager.moveWithCar(vehicle.mesh.position);
-    zoneTagEl.textContent = zoneInfo.name;
-    vehicle.headlights.forEach((l) => { l.intensity = zoneInfo.isNight ? 3.2 : 0; });
-
-    cameraController.update(vehicle.mesh, state.speed, !state.grounded, dt);
-
-    // falling out of the world (e.g. off a canyon edge with no bridge underneath)
-    // is a valid crash, not a bug — catch it the same way as flipping
-    if (state.position.y < -80) {
-      state.crashed = true;
-    }
-
-    // FIX: safety net for physics tunneling glitches (e.g. a wheel raycast
-    // slipping through a chunk seam for a frame). A real jump stays airborne
-    // for a couple seconds at most and never drops far below the terrain it
-    // just left; a tunneling bug keeps free-falling well past that. Rather
-    // than let it turn into a "fell out of the world" crash 80m down, just
-    // snap the car back onto the road near where it lost contact.
-    if (!state.grounded && state.airTime > 3 && state.position.y < lastKnownGroundY - 10) {
-      vehicle.reset(new THREE.Vector3(state.position.x, sampleRoad(state.position.z).y + SPAWN_HEIGHT_OFFSET, state.position.z));
-    }
-
-    if (state.crashed) {
-      gameOver = true;
-      crashDistanceEl.textContent = Math.floor(distance);
-      crashScoreEl.textContent = score;
-      crashScreen.classList.remove('hidden');
-      hud.classList.add('hidden');
-    }
-
-    updateHud(state);
+  if (state === STATE.PLAYING) {
+    step(dt);
+  } else if (state === STATE.MENU) {
+    // slow idle orbit behind the parked car, so the menu isn't a static image
+    const t = performance.now() * 0.00016;
+    const s = sampleRoad(SPAWN_Z);
+    camera.position.set(s.x + Math.sin(t) * 15, s.y + 6, s.z + Math.cos(t) * 15);
+    camera.lookAt(s.x, s.y + 1, s.z);
+    zoneManager.moveWithCar(new THREE.Vector3(s.x, s.y, s.z));
   }
 
   renderer.render(scene, camera);
 }
 
-function updateHud(state) {
+function step(dt) {
+  const carZ = vehicle.chassisBody.position.z;
+  terrain.update(carZ, lastSpeed);
+
+  accumulator += dt;
+  let steps = 0;
+  while (accumulator >= FIXED_DT && steps < MAX_STEPS) {
+    world.step(FIXED_DT);
+    accumulator -= FIXED_DT;
+    steps++;
+  }
+  if (steps === MAX_STEPS) accumulator = 0;
+
+  // tick power-up timers
+  for (const k of Object.keys(timers)) timers[k] = Math.max(0, timers[k] - dt);
+
+  const controls = readControls();
+
+  fuel = Math.max(0, fuel - dt * FUEL_IDLE_BURN - controls.throttle * dt * FUEL_THROTTLE_BURN);
+  if (fuel <= 0) controls.throttle *= 0.15;
+
+  const st = vehicle.update(controls, dt);
+  lastSpeed = st.speed;
+
+  /* ---- pickups ---- */
+  const { taken } = pickups.update(st.position, dt, performance.now());
+  for (const type of taken) {
+    audio.pickup(type);
+    if (type === PICKUP.FUEL) { fuel = Math.min(100, fuel + FUEL_PER_CAN); toast('FUEL +' + FUEL_PER_CAN); }
+    else if (type === PICKUP.BOOST) { timers.boost = BOOST_SECONDS; audio.boostStart(); toast('BOOST!'); }
+    else if (type === PICKUP.SHIELD) { timers.shield = SHIELD_SECONDS; toast('SHIELD UP'); }
+    else if (type === PICKUP.DOUBLE) { timers.double = DOUBLE_SECONDS; toast('DOUBLE SCORE'); }
+    score += 60;
+  }
+
+  /* ---- hazards ---- */
+  const { impacts, onOil } = hazards.update(st.position);
+  if (onOil) timers.oil = OIL_SECONDS;
+  for (const h of impacts) {
+    const dmg = h === HAZARD.ROCK ? ROCK_DAMAGE : BARREL_DAMAGE;
+    effects.impactSparks(st.position);
+    if (timers.shield > 0) {
+      audio.impact(0.6);
+      cameraController.addTrauma(0.35);
+      toast('SHIELD ABSORBED');
+    } else {
+      health -= dmg;
+      audio.impact(1);
+      cameraController.addTrauma(0.75);
+      damageFlash();
+      // knock the car off line, so a hit costs you time as well as health
+      const b = vehicle.chassisBody;
+      b.angularVelocity.y += (Math.random() - 0.5) * 5;
+      b.velocity.scale(0.72, b.velocity);
+    }
+  }
+
+  /* ---- scoring ---- */
+  const mult = timers.double > 0 ? 2 : 1;
+  distance = Math.max(distance, st.position.z);
+  score += Math.floor(st.speed * dt * 1.2) * mult;
+  if (!st.grounded) score += Math.floor(dt * 40) * mult;
+  else lastKnownGroundY = st.position.y;
+  if (st.justFlipped) { score += 500 * mult; showBadge(flipBadgeEl); audio.pickup('BOOST'); }
+
+  /* ---- world / camera / effects ---- */
+  const zoneInfo = zoneManager.update(distance);
+  zoneManager.moveWithCar(vehicle.mesh.position);
+  zoneTagEl.textContent = zoneInfo.name;
+  // FIX: headlights were 3.2 with a 40 m throw, which at 34 m/s lit barely a
+  // second of road. Brighter and much further now, and they stay dimly on by
+  // day so the car reads as a vehicle rather than a box.
+  setLampsLit(zoneInfo.isNight);
+  vehicle.headlights.forEach((l) => {
+    l.intensity = zoneInfo.isNight ? 6.5 : 0.35;
+    l.distance = zoneInfo.isNight ? 110 : 40;
+  });
+
+  /* Wall scrape. Measured from the road frame rather than from contact events:
+   * it is cheap, deterministic, and gives a contact point to throw sparks from
+   * without digging through the solver's contact list. */
+  const frame = sampleRoadFrame(st.position.z);
+  _rel.set(st.position.x - frame.center.x, st.position.y - frame.center.y, st.position.z - frame.center.z);
+  const lateral = _rel.dot(frame.right);
+  const scraping = Math.abs(lateral) > (ROAD_WIDTH / 2 - 1.25) && st.speed > 4 && st.grounded;
+  if (scraping) {
+    const side = Math.sign(lateral);
+    _scrapePoint.copy(st.position).addScaledVector(frame.right, side * 0.9);
+    effects.impactSparks(_scrapePoint, 3);
+    cameraController.addTrauma(0.035);
+    // Scripted cost of riding the rail: a predictable ~18%/s speed scrub plus a
+    // slow hull bleed. Doing it here rather than through solver friction is
+    // what keeps a glancing hit from becoming a dead stop.
+    const b = vehicle.chassisBody;
+    b.velocity.scale(Math.pow(0.82, dt), b.velocity);
+    health -= dt * 2.5;
+  }
+
+  effects.wheelDust(st.wheelPositions, st.speed, st.grounded, dt);
+  if (timers.boost > 0) {
+    _fwd.set(0, 0, 1).applyQuaternion(vehicle.mesh.quaternion);
+    effects.boostTrail(st.position, _fwd, dt);
+  }
+  effects.update(dt);
+
+  cameraController.setBoost(timers.boost > 0);
+  cameraController.update(vehicle.mesh, st.speed, !st.grounded, dt);
+
+  audio.update({
+    speed: st.speed, throttle: controls.throttle, grounded: st.grounded,
+    sliding: st.sliding, shielded: timers.shield > 0, boosting: timers.boost > 0,
+    scraping,
+  }, st.topSpeed);
+
+  /* ---- end conditions ---- */
+  if (!st.grounded && st.airTime > 3 && st.position.y < lastKnownGroundY - 10) {
+    respawnAt(Math.max(SPAWN_Z, st.position.z));
+  } else if (health <= 0) {
+    endRun('Your buggy fell apart');
+  } else if (st.position.y < lastKnownGroundY - 150) {
+    endRun('You went over the edge');
+  } else if (st.crashed) {
+    endRun('You landed on your roof');
+  }
+
+  updateHud(st);
+}
+
+function updateHud(st) {
   distanceEl.innerHTML = Math.floor(distance - SPAWN_Z) + '<span class="hud-unit">m</span>';
   scoreEl.textContent = score;
-  const speedKmh = state.speed * 3.6;
-  speedFillEl.style.width = Math.min(100, (speedKmh / 140) * 100) + '%';
+  if (bestEl) bestEl.textContent = Math.max(best, score);
+  speedFillEl.style.width = Math.min(100, (st.speed * 3.6 / 200) * 100) + '%';
   fuelFillEl.style.width = fuel + '%';
   fuelFillEl.style.background = fuel < 20 ? 'var(--fuel-color-low)' : 'var(--fuel-color)';
-
-  if (!state.grounded && state.airTime > 0.45) {
-    airBadgeEl.classList.remove('hidden');
-    airBadgeEl.style.animation = 'none';
-    void airBadgeEl.offsetWidth;
-    airBadgeEl.style.animation = '';
-  } else {
-    airBadgeEl.classList.add('hidden');
+  if (healthFillEl) {
+    healthFillEl.style.width = Math.max(0, health) + '%';
+    healthFillEl.style.background = health < 30 ? 'var(--fuel-color-low)' : 'var(--health-color)';
   }
+
+  if (powerRowEl) {
+    powerRowEl.innerHTML =
+      (timers.boost > 0 ? `<span class="pip pip-boost">BOOST ${timers.boost.toFixed(1)}</span>` : '') +
+      (timers.shield > 0 ? `<span class="pip pip-shield">SHIELD ${timers.shield.toFixed(1)}</span>` : '') +
+      (timers.double > 0 ? `<span class="pip pip-double">2x ${timers.double.toFixed(1)}</span>` : '') +
+      (timers.oil > 0 ? `<span class="pip pip-oil">NO GRIP</span>` : '');
+  }
+
+  airBadgeEl.classList.toggle('hidden', !(!st.grounded && st.airTime > 0.45));
 }
 
 function showBadge(el) {
+  if (!el) return;
   el.classList.remove('hidden');
   el.style.animation = 'none';
   void el.offsetWidth;
