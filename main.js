@@ -1,13 +1,14 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
-import { sampleRoad, sampleRoadFrame, ROAD_WIDTH } from './roadgen.js';
+import { sampleRoad, sampleRoadFrame, projectToRoad, warmRoad } from './roadgen.js';
 import { createTerrainManager, ROAD_MATERIAL, BARRIER_MATERIAL } from './terrain.js';
 import { createVehicle, CHASSIS_MATERIAL } from './vehicle.js';
 import { createCameraController } from './camera.js';
 import { createZoneManager } from './zones.js';
+import { createBackground } from './background.js';
 import { setLampsLit } from './scenery.js';
 import { createPickupManager, PICKUP, FUEL_PER_CAN, BOOST_SECONDS, SHIELD_SECONDS, DOUBLE_SECONDS } from './pickups.js';
-import { createHazardManager, HAZARD, ROCK_DAMAGE, BARREL_DAMAGE, OIL_GRIP_PENALTY, OIL_SECONDS } from './hazards.js';
+import { createTrafficManager } from './traffic.js';
 import { createEffects } from './effects.js';
 import { createAudio } from './audio.js';
 
@@ -63,10 +64,16 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-const SPAWN_Z = 20;
+/* SPAWN_S, not SPAWN_Z: the car's progress is measured as arc length along the
+ * road, because on a road that genuinely turns, world z is no longer a measure
+ * of how far you have driven. */
+const SPAWN_S = 20;
 const SPAWN_HEIGHT_OFFSET = 1.5;
 const BEST_KEY = 'ridgerunner.best';
 const MAX_HEALTH = 100;
+
+/* How far ahead the camera and the HUD look for corner information. */
+const LOOK_AHEAD_DISTANCE = 34;
 
 /* ============================== STATE MACHINE ==============================
  * Previously `started`, `gameOver` and `paused` were three loose booleans and
@@ -95,18 +102,25 @@ function loadBest() { try { return Number(localStorage.getItem(BEST_KEY)) || 0; 
 function saveBest(v) { try { localStorage.setItem(BEST_KEY, String(v)); } catch { /* private mode */ } }
 
 /* ============================== GAME STATE ============================== */
-let world, terrain, vehicle, cameraController, zoneManager, pickups, hazards, effects, audio;
+let world, terrain, vehicle, cameraController, zoneManager, background,
+  pickups, traffic, effects, audio;
 const keys = {};
 let fuel = 100;
 let health = MAX_HEALTH;
 let score = 0;
 let best = loadBest();
-let distance = SPAWN_Z;
+let distance = SPAWN_S;
+/* The car's current arc length along the road. Maintained frame to frame and
+ * fed back into projectToRoad as a hint, which keeps the search local and cheap
+ * and stops a hairpin snapping the projection onto the other side of the bend
+ * where the two halves of the corner pass close together. */
+let carS = SPAWN_S;
 let lastKnownGroundY = 0;
 let lastSpeed = 0;
+let offRoadTime = 0;
 
 // power-up timers, in seconds remaining
-const timers = { boost: 0, shield: 0, double: 0, oil: 0 };
+const timers = { boost: 0, shield: 0, double: 0 };
 
 const FUEL_IDLE_BURN = 1.2;
 const FUEL_THROTTLE_BURN = 0.9;
@@ -145,8 +159,12 @@ async function boot() {
   updateProgress(6, 'Setting up physics...');
   await yieldFrame();
 
+  // integrate a good stretch of road before any chunk asks for it, so the
+  // first few chunk builds don't each pay to extend the table
+  warmRoad(4000);
+
   terrain = createTerrainManager(scene, world);
-  await terrain.ensureRange(SPAWN_Z, async (frac) => {
+  await terrain.ensureRange(SPAWN_S, async (frac) => {
     updateProgress(6 + frac * 52, 'Carving the mountain road...');
     await yieldFrame();
   });
@@ -156,20 +174,27 @@ async function boot() {
   updateProgress(62, 'Setting the sky...');
   await yieldFrame();
   zoneManager = createZoneManager(scene);
-  updateProgress(74, 'Sky ready');
+  updateProgress(70, 'Raising the mountains...');
+  await yieldFrame();
+  background = createBackground(scene);
+  updateProgress(76, 'Sky ready');
   await yieldFrame();
 
-  updateProgress(78, 'Assembling the buggy...');
+  updateProgress(80, 'Assembling the buggy...');
   await yieldFrame();
-  const s = sampleRoad(SPAWN_Z);
-  vehicle = createVehicle(world, new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, SPAWN_Z));
+  const frame = sampleRoadFrame(SPAWN_S);
+  vehicle = createVehicle(
+    world,
+    frame.center.clone().addScaledVector(frame.roadUp, SPAWN_HEIGHT_OFFSET),
+    headingOf(frame),
+  );
   scene.add(vehicle.sceneGroup);
-  lastKnownGroundY = s.y;
+  lastKnownGroundY = frame.center.y;
   updateProgress(88, 'Buggy ready');
   await yieldFrame();
 
   pickups = createPickupManager(scene);
-  hazards = createHazardManager(scene);
+  traffic = createTrafficManager(scene);
   effects = createEffects(scene);
   audio = createAudio();
   cameraController = createCameraController(camera);
@@ -252,7 +277,6 @@ function readControls() {
     steer: lateral, tilt: lateral,
     handbrake: !!keys['Space'],
     boost: timers.boost > 0,
-    gripScale: timers.oil > 0 ? OIL_GRIP_PENALTY : 1,
   };
 }
 
@@ -268,32 +292,48 @@ function bindHoldButton(id, key) {
 }
 
 /* ============================== RUN LIFECYCLE ============================== */
-function respawnAt(z) {
-  const s = sampleRoad(z);
-  vehicle.reset(new THREE.Vector3(s.x, s.y + SPAWN_HEIGHT_OFFSET, z));
-  terrain.update(z, 0);
-  lastKnownGroundY = s.y;
-  lastSpeed = 0;
+/** Yaw (about world Y) that points along a road frame's tangent. */
+function headingOf(frame) {
+  return Math.atan2(frame.tangent.x, frame.tangent.z);
 }
 
-/** Manual respawn (R). Costs health, so it can't be used to cheese hazards. */
+/**
+ * Puts the car back on the road at arc length `s`, FACING ALONG THE ROAD.
+ * Respawning always pointing down +Z was fine when the road only ever went that
+ * way; on a road that turns up to ~77 degrees off axis it can drop the car
+ * facing a guardrail, or backwards.
+ */
+function respawnAt(s) {
+  const frame = sampleRoadFrame(s);
+  vehicle.reset(
+    frame.center.clone().addScaledVector(frame.roadUp, SPAWN_HEIGHT_OFFSET),
+    headingOf(frame),
+  );
+  carS = s;
+  terrain.update(s, 0);
+  lastKnownGroundY = frame.center.y;
+  lastSpeed = 0;
+  offRoadTime = 0;
+  cameraController.reset();
+}
+
+/** Manual respawn (R). Costs health, so it can't be used to cheese traffic. */
 function respawnPenalty() {
-  respawnAt(Math.max(SPAWN_Z, distance - 15));
+  respawnAt(Math.max(SPAWN_S, distance - 15));
   health = Math.max(1, health - 10);
-  timers.oil = 0;
   toast('RESPAWN  -10 HP');
 }
 
 function beginRun() {
-  respawnAt(SPAWN_Z);
+  respawnAt(SPAWN_S);
   pickups.reset();
-  hazards.reset();
+  traffic.reset();
   effects.reset();
   fuel = 100;
   health = MAX_HEALTH;
   score = 0;
-  distance = SPAWN_Z;
-  timers.boost = timers.shield = timers.double = timers.oil = 0;
+  distance = SPAWN_S;
+  timers.boost = timers.shield = timers.double = 0;
   setState(STATE.PLAYING);
   audio.start();
   audio.resume();
@@ -301,13 +341,13 @@ function beginRun() {
 
 function toMenu() {
   setState(STATE.MENU);
-  respawnAt(SPAWN_Z);
-  distance = SPAWN_Z;
+  respawnAt(SPAWN_S);
+  distance = SPAWN_S;
 }
 
 function endRun(reason) {
   if (score > best) { best = score; saveBest(best); }
-  crashDistanceEl.textContent = Math.floor(distance - SPAWN_Z);
+  crashDistanceEl.textContent = Math.floor(distance - SPAWN_S);
   crashScoreEl.textContent = score;
   if (crashBestEl) crashBestEl.textContent = best;
   if (crashReasonEl) crashReasonEl.textContent = reason;
@@ -352,18 +392,26 @@ function animate() {
   } else if (state === STATE.MENU) {
     // slow idle orbit behind the parked car, so the menu isn't a static image
     const t = performance.now() * 0.00016;
-    const s = sampleRoad(SPAWN_Z);
-    camera.position.set(s.x + Math.sin(t) * 15, s.y + 6, s.z + Math.cos(t) * 15);
-    camera.lookAt(s.x, s.y + 1, s.z);
-    zoneManager.moveWithCar(new THREE.Vector3(s.x, s.y, s.z));
+    const p = sampleRoad(SPAWN_S);
+    camera.position.set(p.x + Math.sin(t) * 15, p.y + 6, p.z + Math.cos(t) * 15);
+    camera.lookAt(p.x, p.y + 1, p.z);
+    const at = new THREE.Vector3(p.x, p.y, p.z);
+    zoneManager.moveWithCar(at);
+    const zi = zoneManager.update(SPAWN_S);
+    background.setPalette(zi.skyColor, zi.groundColor, zi.nightness);
+    background.update(at, camera, dt);
   }
 
   renderer.render(scene, camera);
 }
 
 function step(dt) {
-  const carZ = vehicle.chassisBody.position.z;
-  terrain.update(carZ, lastSpeed);
+  /* Everything downstream is indexed by arc length, so the first thing each
+   * frame does is re-derive it from the car's world position. The previous
+   * value is passed as a hint so the search stays local. */
+  const proj = projectToRoad(vehicle.chassisBody.position, carS, 70);
+  carS = proj.s;
+  terrain.update(carS, lastSpeed);
 
   accumulator += dt;
   let steps = 0;
@@ -386,7 +434,7 @@ function step(dt) {
   lastSpeed = st.speed;
 
   /* ---- pickups ---- */
-  const { taken } = pickups.update(st.position, dt, performance.now());
+  const { taken } = pickups.update(st.position, carS, dt, performance.now());
   for (const type of taken) {
     audio.pickup(type);
     if (type === PICKUP.FUEL) { fuel = Math.min(100, fuel + FUEL_PER_CAN); toast('FUEL +' + FUEL_PER_CAN); }
@@ -396,67 +444,98 @@ function step(dt) {
     score += 60;
   }
 
-  /* ---- hazards ---- */
-  const { impacts, onOil } = hazards.update(st.position);
-  if (onOil) timers.oil = OIL_SECONDS;
-  for (const h of impacts) {
-    const dmg = h === HAZARD.ROCK ? ROCK_DAMAGE : BARREL_DAMAGE;
+  /* ---- traffic ----
+   * The obstacle is a moving vehicle now, not a static hazard, so what the
+   * player is dodging is genuinely traffic: same-direction cars and trucks
+   * they have to find a way past, and oncoming ones closing fast in the
+   * other lane. A hit still knocks the car off line, same as a hazard used
+   * to, just harder — this is a collision with another vehicle, not a rock. */
+  const { impacts } = traffic.update(st.position, carS, dt);
+  for (const hit of impacts) {
     effects.impactSparks(st.position);
     if (timers.shield > 0) {
       audio.impact(0.6);
       cameraController.addTrauma(0.35);
       toast('SHIELD ABSORBED');
     } else {
-      health -= dmg;
+      health -= hit.damage;
       audio.impact(1);
-      cameraController.addTrauma(0.75);
+      cameraController.addTrauma(0.8);
       damageFlash();
+      toast(hit.kind + ' HIT!');
       // knock the car off line, so a hit costs you time as well as health
       const b = vehicle.chassisBody;
       b.angularVelocity.y += (Math.random() - 0.5) * 5;
-      b.velocity.scale(0.72, b.velocity);
+      b.velocity.scale(0.68, b.velocity);
     }
   }
 
-  /* ---- scoring ---- */
+  /* ---- scoring ----
+   * Progress is arc length, not world z. Scoring off z would pay almost nothing
+   * for a hard left-hander (where z barely increases while the car covers a lot
+   * of road) and could even run backwards through a hairpin. */
   const mult = timers.double > 0 ? 2 : 1;
-  distance = Math.max(distance, st.position.z);
+  distance = Math.max(distance, carS);
   score += Math.floor(st.speed * dt * 1.2) * mult;
   if (!st.grounded) score += Math.floor(dt * 40) * mult;
   else lastKnownGroundY = st.position.y;
   if (st.justFlipped) { score += 500 * mult; showBadge(flipBadgeEl); audio.pickup('BOOST'); }
+  // reward holding a slide through a corner rather than merely surviving it
+  if (st.drifting) score += Math.floor(st.slipAngle * st.speed * dt * 6) * mult;
 
-  /* ---- world / camera / effects ---- */
-  const zoneInfo = zoneManager.update(distance);
+  /* ---- world / camera / effects ----
+   * Zone (sky/fog/lighting) must track the car's CURRENT arc length, same as
+   * terrain/pickups/traffic — using the high-water-mark `distance` instead
+   * would leave the sky showing the farthest zone reached even after the car
+   * drives back into an earlier one. */
+  const zoneInfo = zoneManager.update(carS);
   zoneManager.moveWithCar(vehicle.mesh.position);
+  background.setPalette(zoneInfo.skyColor, zoneInfo.groundColor, zoneInfo.nightness);
+  background.update(vehicle.mesh.position, camera, dt);
   zoneTagEl.textContent = zoneInfo.name;
-  // FIX: headlights were 3.2 with a 40 m throw, which at 34 m/s lit barely a
-  // second of road. Brighter and much further now, and they stay dimly on by
-  // day so the car reads as a vehicle rather than a box.
   setLampsLit(zoneInfo.isNight);
   vehicle.headlights.forEach((l) => {
     l.intensity = zoneInfo.isNight ? 6.5 : 0.35;
     l.distance = zoneInfo.isNight ? 110 : 40;
   });
 
-  /* Wall scrape. Measured from the road frame rather than from contact events:
-   * it is cheap, deterministic, and gives a contact point to throw sparks from
-   * without digging through the solver's contact list. */
-  const frame = sampleRoadFrame(st.position.z);
-  _rel.set(st.position.x - frame.center.x, st.position.y - frame.center.y, st.position.z - frame.center.z);
-  const lateral = _rel.dot(frame.right);
-  const scraping = Math.abs(lateral) > (ROAD_WIDTH / 2 - 1.25) && st.speed > 4 && st.grounded;
+  /* Wall scrape / off-road. Measured by projecting onto the road frame rather
+   * than from contact events: it is cheap, deterministic, and gives a contact
+   * point to throw sparks from without digging through the solver's contact
+   * list. `proj` was already computed at the top of this frame.
+   *
+   * The threshold is the LOCAL half-width, because the road widens through
+   * corners now — a fixed ROAD_WIDTH/2 would report a scrape in the middle of
+   * every wide bend. */
+  const frame = proj.frame;
+  const lateral = proj.lateral;
+  const edge = frame.halfWidth - 1.25;
+  const scraping = Math.abs(lateral) > edge && st.speed > 4 && st.grounded;
   if (scraping) {
     const side = Math.sign(lateral);
     _scrapePoint.copy(st.position).addScaledVector(frame.right, side * 0.9);
     effects.impactSparks(_scrapePoint, 3);
     cameraController.addTrauma(0.035);
     // Scripted cost of riding the rail: a predictable ~18%/s speed scrub plus a
-    // slow hull bleed. Doing it here rather than through solver friction is
-    // what keeps a glancing hit from becoming a dead stop.
+    // slow hull bleed. Doing it here rather than through solver friction is what
+    // keeps a glancing hit from becoming a dead stop.
     const b = vehicle.chassisBody;
     b.velocity.scale(Math.pow(0.82, dt), b.velocity);
     health -= dt * 2.5;
+  }
+
+  /* Stuck-detection: if the car somehow ends up well outside the barriers (a
+   * bad landing on top of a rail, say) it used to sit there until the fuel ran
+   * out, since the fall-through check only fires for a big drop. */
+  if (Math.abs(lateral) > frame.halfWidth + 6) {
+    offRoadTime += dt;
+    if (offRoadTime > 2.5) {
+      respawnAt(Math.max(SPAWN_S, carS - 8));
+      health = Math.max(1, health - 5);
+      toast('BACK ON TRACK  -5 HP');
+    }
+  } else {
+    offRoadTime = 0;
   }
 
   effects.wheelDust(st.wheelPositions, st.speed, st.grounded, dt);
@@ -477,7 +556,7 @@ function step(dt) {
 
   /* ---- end conditions ---- */
   if (!st.grounded && st.airTime > 3 && st.position.y < lastKnownGroundY - 10) {
-    respawnAt(Math.max(SPAWN_Z, st.position.z));
+    respawnAt(Math.max(SPAWN_S, carS));
   } else if (health <= 0) {
     endRun('Your buggy fell apart');
   } else if (st.position.y < lastKnownGroundY - 150) {
@@ -490,7 +569,7 @@ function step(dt) {
 }
 
 function updateHud(st) {
-  distanceEl.innerHTML = Math.floor(distance - SPAWN_Z) + '<span class="hud-unit">m</span>';
+  distanceEl.innerHTML = Math.floor(distance - SPAWN_S) + '<span class="hud-unit">m</span>';
   scoreEl.textContent = score;
   if (bestEl) bestEl.textContent = Math.max(best, score);
   speedFillEl.style.width = Math.min(100, (st.speed * 3.6 / 200) * 100) + '%';
@@ -505,8 +584,7 @@ function updateHud(st) {
     powerRowEl.innerHTML =
       (timers.boost > 0 ? `<span class="pip pip-boost">BOOST ${timers.boost.toFixed(1)}</span>` : '') +
       (timers.shield > 0 ? `<span class="pip pip-shield">SHIELD ${timers.shield.toFixed(1)}</span>` : '') +
-      (timers.double > 0 ? `<span class="pip pip-double">2x ${timers.double.toFixed(1)}</span>` : '') +
-      (timers.oil > 0 ? `<span class="pip pip-oil">NO GRIP</span>` : '');
+      (timers.double > 0 ? `<span class="pip pip-double">2x ${timers.double.toFixed(1)}</span>` : '');
   }
 
   airBadgeEl.classList.toggle('hidden', !(!st.grounded && st.airTime > 0.45));

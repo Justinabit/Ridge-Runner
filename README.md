@@ -36,19 +36,22 @@ Then open <http://localhost:8000>.
 
 ## Playing
 
-Survive as long as you can. Two resources run against you:
+Go as far as you can without wrecking. Two resources run against you, and the
+road itself is not empty:
 
 - **Fuel** burns constantly and faster on the throttle. Yellow cans restore it.
   Collecting every can is roughly break-even at speed, so missing them is what
   kills you.
-- **Hull** only ever goes down. Rocks and barrels damage it; oil slicks don't
-  damage you but strip your grip for a moment, which is often worse.
+- **Hull** only ever goes down. Traffic damages it on contact: same-direction
+  cars, trucks and bikes are slower than you and have to be passed; oncoming
+  traffic drives straight at you in the other lane and closes much faster
+  than its own speed alone suggests. Trucks hit hardest, bikes least.
 
 | Pickup | Effect |
 | --- | --- |
 | Yellow can | +22% fuel |
 | Orange cone | Speed boost for 5s |
-| Blue octahedron | Shield for 8s, absorbs hazard hits |
+| Blue octahedron | Shield for 8s, absorbs a traffic hit |
 | Purple ring | Double score for 10s |
 
 On touch devices the four on-screen buttons map to the same controls.
@@ -64,7 +67,7 @@ On touch devices the four on-screen buttons map to the same controls.
 | `camera.js` | Chase and cockpit cameras |
 | `zones.js` | Sky, lighting, fog and scenery per biome |
 | `pickups.js` | Fuel and power-up pickups |
-| `hazards.js` | Rocks, barrels and oil slicks |
+| `traffic.js` | Same-direction and oncoming vehicles the player must dodge |
 | `scenery.js` | Roadside trees, rocks, grass and street lamps |
 | `effects.js` | Pooled particle systems (dust, sparks, boost trail) |
 | `audio.js` | Procedural Web Audio: engine, wind, skid, music, one-shots |
