@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { sampleRoad, ROAD_WIDTH } from './roadgen.js';
 
 export const ZONES = [
   {
@@ -7,7 +6,7 @@ export const ZONES = [
     start: 0,
     sky: [0xffb86b, 0xff6a8f, 0x3a2255],
     fog: 0xff9d6c,
-    fogDensity: 0.0018,
+    fogDensity: 0.0013,
     ambient: 0xffc9a3,
     ambientIntensity: 0.65,
     sun: 0xffd9a0,
@@ -19,7 +18,7 @@ export const ZONES = [
     start: 1400,
     sky: [0x9fd8b0, 0x4f8f6a, 0x1f3d2d],
     fog: 0x6fae7f,
-    fogDensity: 0.0026,
+    fogDensity: 0.0019,
     ambient: 0xbfe6c4,
     ambientIntensity: 0.55,
     sun: 0xe9ffcf,
@@ -31,7 +30,7 @@ export const ZONES = [
     start: 2900,
     sky: [0x9fe0ff, 0x5cb8ff, 0x2a6fbf],
     fog: 0xbfe9ff,
-    fogDensity: 0.0014,
+    fogDensity: 0.0011,
     ambient: 0xffffff,
     ambientIntensity: 0.9,
     sun: 0xffffff,
@@ -43,12 +42,11 @@ export const ZONES = [
     start: 4300,
     sky: [0x2a2450, 0x171236, 0x07061a],
     fog: 0x1b1640,
-    // FIX (night visibility): fog was 0.0032, nearly double the daytime value,
-    // while ambient sat at 0.28. Between them the road faded out a few metres
-    // ahead and the night zone was effectively unplayable. Fog is now thinner
-    // than daytime rather than thicker, and ambient is lifted to a moonlit
-    // level. Street lamps (scenery.js) and stronger headlights do the rest.
-    fogDensity: 0.0016,
+    /* Night fog is deliberately THINNER than daytime, not thicker. It was 0.0032
+     * against an ambient of 0.28, which between them faded the road out a few
+     * metres ahead and made the night zone effectively unplayable. Street lamps,
+     * unlit lane markings and stronger headlights carry the mood instead. */
+    fogDensity: 0.0013,
     ambient: 0x8290d8,
     ambientIntensity: 0.62,
     sun: 0x9aa8ff,
@@ -58,37 +56,46 @@ export const ZONES = [
 ];
 const TRANSITION_BAND = 350;
 
-/**
- * Ground colour at distance z, blended across zone boundaries. Pure function of
- * z so terrain.js can tint verge vertices without needing the zone manager
- * instance. groundTint was previously declared on every zone and never used.
- */
-export function groundTintAt(z, target = new THREE.Color()) {
+/* Fog densities above are all lower than they were. The road now has real
+ * corners and crests worth seeing coming, and the new distant mountains are the
+ * main visual payoff of a hilltop — both are wasted if the view fades out at
+ * 200 m. */
+
+/** Index of the zone active at arc length `s`, plus blend info to the next. */
+function zoneAt(s) {
   let idx = 0;
-  for (let i = 0; i < ZONES.length; i++) if (z >= ZONES[i].start) idx = i;
+  for (let i = 0; i < ZONES.length; i++) if (s >= ZONES[i].start) idx = i;
   const zone = ZONES[idx];
   const next = ZONES[idx + 1];
-  target.set(zone.groundTint);
+  let blend = 0;
+  let target = zone;
   if (next) {
     const bandStart = next.start - TRANSITION_BAND;
-    if (z > bandStart) {
-      const t = Math.min(1, Math.max(0, (z - bandStart) / TRANSITION_BAND));
-      target.lerp(new THREE.Color(next.groundTint), t);
+    if (s > bandStart) {
+      blend = THREE.MathUtils.clamp((s - bandStart) / TRANSITION_BAND, 0, 1);
+      target = next;
     }
   }
-  return target;
+  return { zone, target, blend };
 }
 
-/** Which scenery belongs at distance z. */
-export function sceneryKindAt(z) {
-  let idx = 0;
-  for (let i = 0; i < ZONES.length; i++) if (z >= ZONES[i].start) idx = i;
-  return ZONES[idx].name;
+/**
+ * Ground colour at arc length `s`, blended across zone boundaries. A pure
+ * function so terrain.js can tint verge and hillside vertices without needing
+ * the zone manager instance.
+ */
+export function groundTintAt(s, out = new THREE.Color()) {
+  const { zone, target, blend } = zoneAt(s);
+  out.set(zone.groundTint);
+  if (blend > 0) out.lerp(new THREE.Color(target.groundTint), blend);
+  return out;
 }
-// The road itself streams forever via terrain.js, but decorative props are
-// simple enough to just pre-scatter once, up front, out to a generous but
-// finite horizon — plenty of road for this game's scale (~9km).
-const SCENERY_HORIZON = 9000;
+
+/** Which scenery belongs at arc length `s`. */
+export function sceneryKindAt(s) {
+  const { zone, target, blend } = zoneAt(s);
+  return blend > 0.5 ? target.name : zone.name;
+}
 
 function makeSkyDome(colors) {
   const geo = new THREE.SphereGeometry(1400, 24, 16);
@@ -121,7 +128,10 @@ function makeSkyDome(colors) {
     side: THREE.BackSide,
     depthWrite: false,
   });
-  return new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(geo, mat);
+  // must paint before the distant mountains, which sit "in front of" it
+  mesh.renderOrder = -20;
+  return mesh;
 }
 
 function makeStars(count = 800) {
@@ -136,48 +146,26 @@ function makeStars(count = 800) {
     pos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
   }
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.2, sizeAttenuation: false, transparent: true, opacity: 0 });
-  return new THREE.Points(geo, mat);
+  const mat = new THREE.PointsMaterial({
+    color: 0xffffff, size: 2.2, sizeAttenuation: false,
+    transparent: true, opacity: 0, fog: false, depthWrite: false,
+  });
+  const points = new THREE.Points(geo, mat);
+  points.renderOrder = -19;
+  return points;
 }
 
-function makeTree(kind) {
-  const g = new THREE.Group();
-  if (kind === 'pine') {
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 1.2, 5), new THREE.MeshLambertMaterial({ color: 0x5b3a29 }));
-    trunk.position.y = 0.6;
-    const leaves = new THREE.Mesh(new THREE.ConeGeometry(1.1, 3.2, 6), new THREE.MeshLambertMaterial({ color: 0x2f6b3f, flatShading: true }));
-    leaves.position.y = 2.6;
-    g.add(trunk, leaves);
-  } else if (kind === 'palm') {
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.22, 3.2, 6), new THREE.MeshLambertMaterial({ color: 0x8a6a3f }));
-    trunk.position.y = 1.6;
-    trunk.rotation.z = 0.12;
-    const frondMat = new THREE.MeshLambertMaterial({ color: 0x4fae5f, flatShading: true });
-    for (let i = 0; i < 5; i++) {
-      const frond = new THREE.Mesh(new THREE.ConeGeometry(0.35, 1.8, 4), frondMat);
-      frond.position.y = 3.2;
-      frond.rotation.z = Math.PI / 2.4;
-      frond.rotation.y = (i / 5) * Math.PI * 2;
-      g.add(frond);
-    }
-    g.add(trunk);
-  } else {
-    // deciduous
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 1.4, 5), new THREE.MeshLambertMaterial({ color: 0x5b3a29 }));
-    trunk.position.y = 0.7;
-    const leaves = new THREE.Mesh(new THREE.IcosahedronGeometry(1.3, 0), new THREE.MeshLambertMaterial({ color: 0x6cb04a, flatShading: true }));
-    leaves.position.y = 2.3;
-    g.add(trunk, leaves);
-  }
-  return g;
-}
+/* NOTE: this used to pre-scatter a few dozen trees up front, out to a fixed
+ * 9 km horizon, positioned by sampling the road at a world z. Both halves of
+ * that are gone:
+ *   - scenery.js now builds roadside props per chunk from the actual road
+ *     frames, so props are placed on ground by construction and continue
+ *     forever rather than stopping at 9 km;
+ *   - and the placement maths could not survive the road becoming a curve
+ *     anyway, since it indexed the road by z.
+ * What remains here is purely atmosphere: sky, light, fog and the night lamps
+ * managed per chunk elsewhere. */
 
-// FIX: main.js now calls `createZoneManager(scene)` directly, without
-// `await` — so this must be synchronous, not async. It no longer takes a
-// `track` object either (there's no whole-track curve anymore now that the
-// road streams via terrain.js), so prop placement uses sampleRoad(z) from
-// roadgen.js instead of track.curve.getPointAt(t), and ROAD_WIDTH is
-// imported directly instead of coming from track.roadWidth.
 export function createZoneManager(scene) {
   const skyDome = makeSkyDome(ZONES[0].sky);
   scene.add(skyDome);
@@ -187,127 +175,45 @@ export function createZoneManager(scene) {
   const ambientLight = new THREE.AmbientLight(ZONES[0].ambient, ZONES[0].ambientIntensity);
   scene.add(ambientLight);
 
+  /* A weak hemisphere light on top of the ambient. Flat ambient light makes
+   * every face of a low-poly model exactly the same brightness, which is what
+   * made the old hills read as silhouettes; a sky/ground gradient gives upward
+   * faces and downward faces different tints for almost no cost. */
+  const hemiLight = new THREE.HemisphereLight(ZONES[0].sky[1], ZONES[0].groundTint, 0.45);
+  scene.add(hemiLight);
+
   const sunLight = new THREE.DirectionalLight(ZONES[0].sun, ZONES[0].sunIntensity);
   sunLight.position.set(-60, 90, -40);
   sunLight.castShadow = true;
   sunLight.shadow.mapSize.set(1024, 1024);
-  sunLight.shadow.camera.left = -60;
-  sunLight.shadow.camera.right = 60;
-  sunLight.shadow.camera.top = 60;
-  sunLight.shadow.camera.bottom = -60;
-  sunLight.shadow.camera.far = 250;
+  sunLight.shadow.camera.left = -70;
+  sunLight.shadow.camera.right = 70;
+  sunLight.shadow.camera.top = 70;
+  sunLight.shadow.camera.bottom = -70;
+  sunLight.shadow.camera.far = 260;
+  sunLight.shadow.bias = -0.0008;
   scene.add(sunLight);
   scene.add(sunLight.target);
 
   scene.fog = new THREE.FogExp2(ZONES[0].fog, ZONES[0].fogDensity);
-
-  // ---------------- instanced props per zone ----------------
-  const propGroup = new THREE.Group();
-  scene.add(propGroup);
-
-  function scatterProps(kind, zoneStart, zoneEnd, count, sideRange) {
-    const proto = makeTree(kind);
-    const meshes = [];
-    // FIX: trunk/leaves/frond parts are never added to a rendered scene
-    // graph, so three.js never calls updateMatrix() on them and their
-    // .matrix stayed at the identity default even after position/rotation
-    // were set above. Without this, every part of every instanced tree
-    // collapsed onto the same point instead of forming a tree.
-    proto.traverse((c) => { if (c.isMesh) { c.updateMatrix(); meshes.push(c); } });
-    const instanced = meshes.map((m) => {
-      const inst = new THREE.InstancedMesh(m.geometry, m.material, count);
-      inst.castShadow = true;
-      propGroup.add(inst);
-      return { inst, localMatrix: m.matrix.clone() };
-    });
-
-    const dummy = new THREE.Object3D();
-    for (let i = 0; i < count; i++) {
-      const z = zoneStart + Math.random() * (zoneEnd - zoneStart);
-      const sample = sampleRoad(z); // FIX: was track.curve.getPointAt(t)
-      const side = Math.random() < 0.5 ? -1 : 1;
-      const dist = ROAD_WIDTH / 2 + 4 + Math.random() * sideRange; // FIX: was track.roadWidth
-      dummy.position.set(sample.x + side * dist, sample.y - 0.2, sample.z);
-      const s = 0.7 + Math.random() * 0.8;
-      dummy.scale.set(s, s, s);
-      dummy.rotation.y = Math.random() * Math.PI * 2;
-      dummy.updateMatrix();
-      for (const { inst, localMatrix } of instanced) {
-        const m = dummy.matrix.clone().multiply(localMatrix);
-        inst.setMatrixAt(i, m);
-      }
-    }
-    instanced.forEach(({ inst }) => (inst.instanceMatrix.needsUpdate = true));
-  }
-
-  // seed props across each zone range (using the *next* zone's start as the end)
-  const scatterJobs = [];
-  for (let i = 0; i < ZONES.length; i++) {
-    const zone = ZONES[i];
-    const end = i + 1 < ZONES.length ? ZONES[i + 1].start : SCENERY_HORIZON; // FIX: was track.length
-    if (zone.name === 'FOREST') {
-      scatterJobs.push(() => scatterProps('pine', zone.start, end, 55, 22));
-      scatterJobs.push(() => scatterProps('deciduous', zone.start, end, 24, 26));
-    } else if (zone.name === 'BEACH') {
-      scatterJobs.push(() => scatterProps('palm', zone.start, end, 28, 20));
-    } else if (zone.name === 'SUNSET HILLS') {
-      scatterJobs.push(() => scatterProps('deciduous', zone.start, end, 14, 30));
-    }
-    // NIGHT zone: sparse glowing "campfire" point lights instead of trees, added below
-  }
-
-  // night campfires / distant town lights (simple emissive spheres + point lights, sparse)
-  const nightZone = ZONES[ZONES.length - 1];
-  const fireGroup = new THREE.Group();
-  scene.add(fireGroup);
-  scatterJobs.push(() => {
-    const fireMat = new THREE.MeshBasicMaterial({ color: 0xff8a3d });
-    for (let i = 0; i < 10; i++) {
-      const z = nightZone.start + Math.random() * (SCENERY_HORIZON - nightZone.start);
-      const sample = sampleRoad(z); // FIX: was track.curve.getPointAt(t)
-      const side = Math.random() < 0.5 ? -1 : 1;
-      const dist = ROAD_WIDTH / 2 + 10 + Math.random() * 40;
-      const fire = new THREE.Mesh(new THREE.SphereGeometry(0.4, 6, 6), fireMat);
-      fire.position.set(sample.x + side * dist, sample.y + 0.3, sample.z);
-      const glow = new THREE.PointLight(0xff8a3d, 0, 12);
-      glow.position.copy(fire.position);
-      fireGroup.add(fire, glow);
-    }
-  });
-
-  // FIX: no longer awaited/async — main.js calls createZoneManager(scene)
-  // directly and uses the return value immediately, so all scattering runs
-  // synchronously here. This is cheap (just placing InstancedMesh matrices,
-  // no heavy geometry work) so it doesn't need to yield across frames.
-  scatterJobs.forEach((job) => job());
 
   function lerpColor(a, b, t) {
     return new THREE.Color(a).lerp(new THREE.Color(b), t);
   }
 
   let currentZoneName = ZONES[0].name;
+  // exposed so background.js can match its haze to the sky without recomputing
+  const skyMid = new THREE.Color(ZONES[0].sky[1]);
+  const groundColor = new THREE.Color(ZONES[0].groundTint);
+  let nightness = 0;
 
-  function update(distance) {
-    // find current & next zone
-    let idx = 0;
-    for (let i = 0; i < ZONES.length; i++) if (distance >= ZONES[i].start) idx = i;
-    const zone = ZONES[idx];
-    const next = ZONES[idx + 1];
-
-    let blend = 0;
-    let target = zone;
-    if (next) {
-      const bandStart = next.start - TRANSITION_BAND;
-      if (distance > bandStart) {
-        blend = THREE.MathUtils.clamp((distance - bandStart) / TRANSITION_BAND, 0, 1);
-        target = next;
-      }
-    }
+  /** @param {number} s arc length travelled along the road */
+  function update(s) {
+    const { zone, target, blend } = zoneAt(s);
 
     const fogColor = lerpColor(zone.fog, target.fog, blend);
-    const fogDensity = THREE.MathUtils.lerp(zone.fogDensity, target.fogDensity, blend);
     scene.fog.color.copy(fogColor);
-    scene.fog.density = fogDensity;
+    scene.fog.density = THREE.MathUtils.lerp(zone.fogDensity, target.fogDensity, blend);
 
     ambientLight.color.copy(lerpColor(zone.ambient, target.ambient, blend));
     ambientLight.intensity = THREE.MathUtils.lerp(zone.ambientIntensity, target.ambientIntensity, blend);
@@ -315,30 +221,41 @@ export function createZoneManager(scene) {
     sunLight.color.copy(lerpColor(zone.sun, target.sun, blend));
     sunLight.intensity = THREE.MathUtils.lerp(zone.sunIntensity, target.sunIntensity, blend);
 
+    skyMid.copy(lerpColor(zone.sky[1], target.sky[1], blend));
+    groundColor.copy(lerpColor(zone.groundTint, target.groundTint, blend));
+    hemiLight.color.copy(skyMid);
+    hemiLight.groundColor.copy(groundColor);
+
     skyDome.material.uniforms.colorTop.value.copy(lerpColor(zone.sky[0], target.sky[0], blend));
-    skyDome.material.uniforms.colorMid.value.copy(lerpColor(zone.sky[1], target.sky[1], blend));
+    skyDome.material.uniforms.colorMid.value.copy(skyMid);
     skyDome.material.uniforms.colorBottom.value.copy(lerpColor(zone.sky[2], target.sky[2], blend));
 
-    const isNightish = zone.name === 'NIGHT' ? 1 - blend : (target.name === 'NIGHT' ? blend : 0);
-    stars.material.opacity = isNightish;
-    fireGroup.children.forEach((c) => {
-      if (c.isPointLight) c.intensity = isNightish * 2.2;
-    });
+    nightness = zone.name === 'NIGHT' ? 1 - blend : (target.name === 'NIGHT' ? blend : 0);
+    stars.material.opacity = nightness;
 
     currentZoneName = blend > 0.5 ? target.name : zone.name;
 
-    return { name: currentZoneName, isNight: isNightish > 0.5 };
+    return {
+      name: currentZoneName,
+      isNight: nightness > 0.5,
+      nightness,
+      skyColor: skyMid,
+      groundColor,
+    };
   }
 
   const sunOffset = new THREE.Vector3(-60, 90, -40);
   function moveWithCar(position) {
     skyDome.position.set(position.x, 0, position.z);
     stars.position.set(position.x, 0, position.z);
-    // keep the directional light (and its shadow frustum) centered on the car
-    sunLight.position.set(position.x + sunOffset.x, sunOffset.y, position.z + sunOffset.z);
+    // keep the directional light (and its shadow frustum) centred on the car
+    sunLight.position.set(position.x + sunOffset.x, position.y + sunOffset.y, position.z + sunOffset.z);
     sunLight.target.position.set(position.x, position.y, position.z);
     sunLight.target.updateMatrixWorld();
   }
 
-  return { update, moveWithCar, sunLight, get currentZoneName() { return currentZoneName; } };
+  return {
+    update, moveWithCar, sunLight,
+    get currentZoneName() { return currentZoneName; },
+  };
 }

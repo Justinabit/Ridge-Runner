@@ -1,12 +1,18 @@
 import * as THREE from 'three';
-import { sampleRoad } from './roadgen.js';
+import { sampleRoadFrame } from './roadgen.js';
 import { hash1 } from './noise.js';
 
 /* Pickups: fuel plus three power-ups.
  *
  * Placement is a pure function of the road, so every player sees the same
  * layout, nothing needs generating up front, and the sequence continues
- * forever. Only a window around the car exists as meshes at any time. */
+ * forever. Only a window around the car exists as meshes at any time.
+ *
+ * Indexed by ARC LENGTH along the road rather than by world z. Under the old
+ * z-indexing a pickup in a hairpin could be metres off the tarmac, or two
+ * different stretches of road could claim the same slot — and the spawn window
+ * ("z between here and here") stops meaning "the road ahead" the moment the
+ * road can turn back on itself. */
 
 export const PICKUP = {
   FUEL: 'FUEL',
@@ -15,7 +21,7 @@ export const PICKUP = {
   DOUBLE: 'DOUBLE',
 };
 
-const SPACING = 190;          // metres between pickups of any kind
+const SPACING = 190;          // metres of road between pickups of any kind
 const PICKUP_RADIUS = 4.2;
 const WINDOW_AHEAD = 900;
 const WINDOW_BEHIND = 120;
@@ -81,11 +87,17 @@ function typeForIndex(i) {
   return PICKUP.DOUBLE;
 }
 
+/* Placed using the road's own frame, so "a bit left of centre" stays a bit left
+ * of centre through a corner instead of drifting off the tarmac. The lateral
+ * offset is scaled by the local half-width so it lands inside the road even
+ * where the road is at its narrowest. */
 function positionFor(i) {
-  const z = i * SPACING;
-  const s = sampleRoad(z);
-  const lateral = (hash1(i * 7.31) - 0.5) * 4.6;
-  return new THREE.Vector3(s.x + lateral, s.y + 1.05, z);
+  const s = i * SPACING;
+  const frame = sampleRoadFrame(s);
+  const across = (hash1(i * 7.31) - 0.5) * 1.1 * frame.halfWidth;
+  return frame.center.clone()
+    .addScaledVector(frame.right, across)
+    .addScaledVector(frame.roadUp, 1.05);
 }
 
 export function createPickupManager(scene) {
@@ -98,6 +110,8 @@ export function createPickupManager(scene) {
     if (i < 1 || active.has(i) || collected.has(i)) return;
     const mesh = makeMesh(typeForIndex(i));
     mesh.position.copy(positionFor(i));
+    // cached so the bob animation doesn't re-project the road every frame
+    mesh.userData.baseY = mesh.position.y;
     group.add(mesh);
     active.set(i, mesh);
   }
@@ -110,24 +124,27 @@ export function createPickupManager(scene) {
   }
 
   /**
-   * @param {{x:number,y:number,z:number}} carPos
-   * @param {number} magnetRadius unused hook, kept at 0
+   * @param {{x:number,y:number,z:number}} carPos world position of the car
+   * @param {number} carS the car's arc length along the road
    * @returns {{taken: string[]}} pickup types collected this frame
    */
-  function update(carPos, dt, t) {
-    const first = Math.ceil((carPos.z - WINDOW_BEHIND) / SPACING);
-    const last = Math.ceil((carPos.z + WINDOW_AHEAD) / SPACING);
+  function update(carPos, carS, dt, t) {
+    const first = Math.max(1, Math.ceil((carS - WINDOW_BEHIND) / SPACING));
+    const last = Math.ceil((carS + WINDOW_AHEAD) / SPACING);
     for (let i = first; i <= last; i++) spawn(i);
 
     const taken = [];
     for (const [i, mesh] of Array.from(active)) {
-      if (mesh.position.z < carPos.z - WINDOW_BEHIND || mesh.position.z > carPos.z + WINDOW_AHEAD) {
+      const s = i * SPACING;
+      if (s < carS - WINDOW_BEHIND || s > carS + WINDOW_AHEAD) {
         despawn(i);
         continue;
       }
       mesh.rotation.y += dt * 1.7;
-      mesh.position.y = positionFor(i).y + Math.sin(t * 0.003 + i) * 0.14;
+      mesh.position.y = mesh.userData.baseY + Math.sin(t * 0.003 + i) * 0.14;
 
+      // full 3D proximity: on a steep grade a pickup can be well above or below
+      // the car while its horizontal distance is almost nothing
       const dx = mesh.position.x - carPos.x;
       const dy = mesh.position.y - carPos.y;
       const dz = mesh.position.z - carPos.z;
